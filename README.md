@@ -236,6 +236,14 @@ $stop-that-shit change agents=1 -- 使用一个独立测试 subagent。
 
 还不知道全部受影响文件，就别急着锁 `files=`。先沿调用链查清楚。
 
+### Fork 扩展：审计产物目录
+
+`review` 默认仍然只读。Codex、Claude Code 和 OpenCode 可通过显式
+`audit-dir=/绝对路径/本次任务` 允许已知文件工具保存审计报告和消息文件，
+其余写入保持受限。目录需预先创建；不放行 shell 或任意消息发送。
+用 `audit-dir=none` 或新的裸 `review` 撤销。
+[最小示例、支持工具及安全边界](docs/task-audit-output.md)。CrewMoor 固定 binding 回报仍待验证。
+
 ### 红章管到哪里
 
 Skill 负责工程判断。Guard 在受支持的工具调用前检查明确边界：

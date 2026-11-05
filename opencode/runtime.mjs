@@ -19,7 +19,7 @@ export function mentionsDirective(text) {
 }
 
 export function allowsHostPromotion(text, contract) {
-  return !mentionsDirective(text) && !parseContractPrompt(text, contract).correction;
+  return !contract.auditDirectory && !mentionsDirective(text) && !parseContractPrompt(text, contract).correction;
 }
 
 export function directiveErrorText(error) {

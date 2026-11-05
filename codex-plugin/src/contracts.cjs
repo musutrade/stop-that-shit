@@ -1,5 +1,7 @@
 'use strict';
 
+const { validAuditDirectory } = require('./audit-output.cjs');
+
 const MODES = new Set(['answer', 'review', 'change', 'monitor', 'open']);
 const LEVELS = new Set(['watch', 'guard', 'lock', 'off']);
 const HASH_POLICIES = new Set(['deny', 'ask', 'allow']);
@@ -13,6 +15,7 @@ function defaultContract() {
     agentBudget: DEFAULT_AGENT_LIMIT,
     hashPolicy: 'deny',
     allowedPaths: null,
+    auditDirectory: null,
     dependencyPolicy: 'ask',
     source: 'default'
   };
@@ -20,7 +23,7 @@ function defaultContract() {
 
 function directiveHead(prompt, matchEnd) {
   const tail = prompt.slice(matchEnd).replace(/^[ \t]+/, '');
-  const boundaries = [tail.indexOf('--'), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
+  const boundaries = [tail.search(/(?:^|[ \t])--(?=[ \t]|$)/), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
     .filter((index) => index >= 0);
   const end = boundaries.length ? Math.min(...boundaries) : tail.length;
   return tail.slice(0, end).trim();
@@ -92,6 +95,17 @@ function parseDirective(prompt) {
     const files = /^files=(.*)$/i.exec(rawToken);
     if (files) {
       setField('allowedPaths', files[1].split('|').map((value) => value.replace(/\\/g, '/')).filter(Boolean), rawToken);
+      continue;
+    }
+    const audit = /^audit-dir=(.*)$/i.exec(rawToken);
+    if (audit) {
+      const directory = audit[1] === 'none' ? null : audit[1];
+      if (directory !== null && !validAuditDirectory(directory)) {
+        parsed.error = { code: 'INVALID_AUDIT_DIRECTORY', token: rawToken,
+          message: 'audit-dir requires one native absolute task directory without traversal, aliases, whitespace or wildcards; use none to revoke it.' };
+        break;
+      }
+      setField('auditDirectory', directory, rawToken);
       continue;
     }
     const dependencies = /^deps=(deny|ask|allow)$/.exec(token);
@@ -270,6 +284,9 @@ function narrowContract(parentContract, childContract) {
     agentBudget: Math.min(parent.agentBudget, child.agentBudget),
     hashPolicy: narrowerScalar(parent.hashPolicy, child.hashPolicy, POLICY_AUTHORITY),
     allowedPaths: narrowerPaths(parent.allowedPaths, child.allowedPaths),
+    // A child can inherit the same grant or revoke it, never create one.
+    auditDirectory: child.mode === 'review' && parent.auditDirectory === child.auditDirectory
+      ? child.auditDirectory : null,
     dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY)
   };
 }
@@ -292,6 +309,16 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
         warning: null,
         error: directive.error
       };
+    }
+    if (directive.auditDirectory && (directive.mode || next.mode) !== 'review') {
+      return { contract: previous, changed: false, directive: true, correction: false, warning: null,
+        error: { code: 'AUDIT_REQUIRES_REVIEW', message: 'audit-dir is an explicit review output exception; use it with review.' } };
+    }
+    // A new mode directive starts a new task boundary. Ordinary continuation
+    // prompts retain the grant; bare review and natural restrictions revoke it.
+    if (directive.mode || Object.hasOwn(directive, 'auditDirectory')) {
+      next.auditDirectory = directive.auditDirectory ?? null;
+      if (next.auditDirectory !== previous.auditDirectory) changed = true;
     }
     if (directive.mode && directive.mode !== next.mode) {
       next.mode = directive.mode;
@@ -326,6 +353,8 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
     }
     next.source = 'directive';
   } else if (correction) {
+    if (next.auditDirectory !== null) changed = true;
+    next.auditDirectory = null;
     if (correction.mode !== next.mode) {
       next.mode = correction.mode;
       changed = true;

@@ -25,7 +25,7 @@ function command(executable, args, options) {
 
 for (const version of ['V1', 'V2']) {
   const executable = process.env[`STS_OPENCODE_${version}_BIN`];
-  test(`packed OpenCode ${version}: review denial, continued read, restart without authorization and explicit change`, { skip: !executable, timeout: 300000 }, async (t) => {
+  test(`packed OpenCode ${version}: review denial, bounded audit output, restart, revocation and explicit change`, { skip: !executable, timeout: 300000 }, async (t) => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), `sts-${version.toLowerCase()}-`));
     if (!process.env.STS_OPENCODE_KEEP_SMOKE) t.after(() => fs.rmSync(work, { recursive: true, force: true }));
     else t.diagnostic(`Evidence directory: ${work}`);
@@ -33,6 +33,14 @@ for (const version of ['V1', 'V2']) {
     fs.mkdirSync(workspace);
     fs.writeFileSync(path.join(workspace, 'read.txt'), 'STS_READ_SUCCEEDED');
     fs.writeFileSync(path.join(workspace, 'restart-read.txt'), 'STS_RESTART_READ_SUCCEEDED');
+    const auditDir = path.join(workspace, 'audit-output', 'task-001');
+    fs.mkdirSync(auditDir, { recursive: true });
+    const reportPath = path.join(auditDir, 'report.md');
+    const report = '# Review report\n\nStatus: initial review\n\n' + Array.from({ length: 400 }, (_, index) =>
+      `## Finding ${index + 1}\nThe reviewed source remains unchanged. This detailed finding belongs only in the task audit output.\n\n`).join('');
+    const restartedReport = report.replace('Status: initial review', 'Status: resumed review');
+    const message = { type: 'review.complete', report: 'report.md', findings: 400, sourceChanged: false };
+    const messageContent = JSON.stringify(message, null, 2) + '\n';
     const dataDir = path.join(work, 'sts-data');
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(OPENCODE_|ANTHROPIC_|OPENAI_|GOOGLE_|GEMINI_|AWS_|AZURE_)/i.test(key)));
     for (const [key, folder] of Object.entries({ XDG_CONFIG_HOME: 'config', XDG_DATA_HOME: 'data', XDG_CACHE_HOME: 'cache', XDG_STATE_HOME: 'state', HOME: 'home', USERPROFILE: 'home' })) {
@@ -61,6 +69,20 @@ for (const version of ['V1', 'V2']) {
     const install = await command(process.execPath, [npmCli, 'install', '--prefix', installRoot, '--ignore-scripts', '--no-audit', '--no-fund', tarball], { cwd: work });
     assert.equal(install.status, 0, install.stderr);
 
+    const fileInput = (file) => ({ [version === 'V1' ? 'filePath' : 'path']: file });
+    const write = (file, content = 'STS_CHANGE_SUCCEEDED') => ({ name: 'write', args: { ...fileInput(file), content } });
+    const read = (file) => ({ name: 'read', args: fileInput(file) });
+    const steps = {
+      review: [write(path.join(workspace, 'review-blocked.txt')), read(path.join(workspace, 'read.txt'))],
+      restart: [write(path.join(workspace, 'restart-blocked.txt')), read(path.join(workspace, 'restart-read.txt'))],
+      audit: [write(reportPath, report), write(path.join(auditDir, 'message.json'), messageContent),
+        write(path.join(workspace, 'audit-blocked.txt')), read(path.join(workspace, 'read.txt'))],
+      'audit-restart': [read(reportPath),
+        { name: 'edit', args: { ...fileInput(reportPath), oldString: 'Status: initial review', newString: 'Status: resumed review' } },
+        write(path.join(workspace, 'audit-restart-blocked.txt')), read(path.join(workspace, 'restart-read.txt'))],
+      revoked: [write(path.join(auditDir, 'revoked-blocked.txt')), read(path.join(workspace, 'read.txt'))],
+      change: [write(path.join(workspace, 'allowed.txt'))],
+    };
     let phase = 'review', next = 0;
     const requests = [];
     const server = http.createServer((req, res) => {
@@ -72,14 +94,9 @@ for (const version of ['V1', 'V2']) {
         requests.push({ phase, body });
         const hasTools = body.tools?.some((tool) => tool.function?.name === 'write');
         let call;
-        if (hasTools && next < (phase === 'change' ? 1 : 2)) {
-          const tool = phase !== 'change' && next === 1 ? 'read' : 'write';
-          const file = tool === 'read'
-            ? (phase === 'restart' ? 'restart-read.txt' : 'read.txt')
-            : (phase === 'change' ? 'allowed.txt' : `${phase}-blocked.txt`);
-          const args = { [version === 'V1' ? 'filePath' : 'path']: path.join(workspace, file) };
-          if (tool === 'write') args.content = 'STS_CHANGE_SUCCEEDED';
-          call = { index: 0, id: `smoke_${phase}_${++next}`, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } };
+        if (hasTools && next < steps[phase].length) {
+          const { name, args } = steps[phase][next];
+          call = { index: 0, id: `smoke_${phase}_${++next}`, type: 'function', function: { name, arguments: JSON.stringify(args) } };
         }
         const message = call ? { role: 'assistant', tool_calls: [call] } : { role: 'assistant', content: 'STS_SMOKE_COMPLETE' };
         const finish_reason = call ? 'tool_calls' : 'stop';
@@ -137,9 +154,9 @@ for (const version of ['V1', 'V2']) {
       .flatMap(({ body }) => body.messages || [])
       .filter((message) => message.role === 'tool' && message.tool_call_id === `smoke_${phaseName}_${index}`)
       .map((message) => JSON.stringify(message.content));
-    const assertReview = (phaseName, result, marker) => {
+    const assertReview = (phaseName, result, marker, blockedFile = path.join(workspace, `${phaseName}-blocked.txt`)) => {
       assert.equal(next, 2, `${phaseName} must attempt both a write and a subsequent read`);
-      assert.ok(!fs.existsSync(path.join(workspace, `${phaseName}-blocked.txt`)), result.stdout);
+      assert.ok(!fs.existsSync(blockedFile), result.stdout);
       assert.ok(toolResults(phaseName, 1).some((body) => body.includes('MODE_FORBIDS_MUTATION')),
         `${phaseName}: model must receive this write's Guard denial`);
       assert.ok(toolResults(phaseName, 2).some((body) => body.includes(marker)),
@@ -163,6 +180,47 @@ for (const version of ['V1', 'V2']) {
     assertReview('restart', restarted, 'STS_RESTART_READ_SUCCEEDED');
     assert.match(restarted.stdout, /STS_SMOKE_COMPLETE/);
     assert.deepEqual(sessionState().contract, reviewContract, 'Restart must preserve the same session contract without new authorization');
+
+    phase = 'audit'; next = 0;
+    const audited = await run(`$stop-that-shit review audit-dir=${auditDir} -- Write the long report and message JSON for this task, try audit-blocked.txt, then read read.txt.`, sessionID);
+    assert.equal(next, 4, 'Audit review must attempt both artifacts, an outside write and a subsequent read');
+    assert.ok(report.length > 40000, 'The report must exercise long-form output rather than a chat-sized marker');
+    assert.equal(fs.readFileSync(reportPath, 'utf8'), report);
+    assert.equal(fs.readFileSync(path.join(auditDir, 'message.json'), 'utf8'), messageContent);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(auditDir, 'message.json'), 'utf8')), message);
+    assert.ok(!fs.existsSync(path.join(workspace, 'audit-blocked.txt')), audited.stdout);
+    assert.ok(toolResults('audit', 3).some((body) => body.includes('MODE_FORBIDS_MUTATION')),
+      'Audit review must still return a Guard denial for a source write outside its output directory');
+    assert.ok(toolResults('audit', 4).some((body) => body.includes('STS_READ_SUCCEEDED')),
+      'Audit review must continue reading source after denying an outside write');
+    assert.match(audited.stdout, /STS_SMOKE_COMPLETE/);
+    const auditContract = sessionState().contract;
+    assert.equal(auditContract.mode, 'review');
+    assert.equal(auditContract.source, 'directive');
+    assert.equal(auditContract.auditDirectory, auditDir);
+
+    phase = 'audit-restart'; next = 0;
+    const auditRestarted = await run('Continue the task by reading and updating the existing report, trying audit-restart-blocked.txt, then reading restart-read.txt.', sessionID);
+    assert.equal(next, 4, 'Restart must attempt the audit read and edit, an outside write and a subsequent source read');
+    assert.ok(toolResults('audit-restart', 1).some((body) => body.includes('Status: initial review')),
+      'Restart must read the report before editing it');
+    assert.equal(fs.readFileSync(reportPath, 'utf8'), restartedReport);
+    assert.ok(!fs.existsSync(path.join(workspace, 'audit-restart-blocked.txt')), auditRestarted.stdout);
+    assert.ok(toolResults('audit-restart', 3).some((body) => body.includes('MODE_FORBIDS_MUTATION')),
+      'Restart must preserve the audit boundary for outside writes');
+    assert.ok(toolResults('audit-restart', 4).some((body) => body.includes('STS_RESTART_READ_SUCCEEDED')),
+      'Restart must continue reading source after denying an outside write');
+    assert.match(auditRestarted.stdout, /STS_SMOKE_COMPLETE/);
+    assert.deepEqual(sessionState().contract, auditContract,
+      'An ordinary continuation after restart must preserve the audit grant without promoting review to change');
+
+    phase = 'revoked'; next = 0;
+    const revoked = await run('$stop-that-shit review -- Try writing another audit artifact, then read read.txt.', sessionID);
+    assertReview('revoked', revoked, 'STS_READ_SUCCEEDED', path.join(auditDir, 'revoked-blocked.txt'));
+    assert.match(revoked.stdout, /STS_SMOKE_COMPLETE/);
+    assert.equal(sessionState().contract.mode, 'review');
+    assert.equal(sessionState().contract.auditDirectory, null, 'Bare review must revoke the previous audit grant');
+    assert.equal(fs.readFileSync(reportPath, 'utf8'), restartedReport, 'Revocation must leave existing audit output unchanged');
 
     phase = 'change'; next = 0;
     const changed = await run('$stop-that-shit change -- Write allowed.txt.', sessionID);

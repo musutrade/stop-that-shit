@@ -1,5 +1,6 @@
 'use strict';
 
+const { allowsAuditWrite } = require('./audit-output.cjs');
 const nodePath = require('node:path');
 const { DEFAULT_AGENT_LIMIT } = require('./contracts.cjs');
 const { inspectDelegation } = require('./delegation-state.cjs');
@@ -93,7 +94,7 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
   }
 
   const nonMutatingMode = ['answer', 'review', 'monitor'].includes(mode);
-  if (nonMutatingMode && action.mutability === 'write') {
+  if (nonMutatingMode && action.mutability === 'write' && !allowsAuditWrite(contract, action)) {
     return decision(
       controlledOutcome(level),
       'I',

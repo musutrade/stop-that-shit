@@ -4,6 +4,8 @@ const {
   defaultContract, normalizeContract, MODES, LEVELS, HASH_POLICIES, SCOPE_POLICIES
 } = require('./contracts.cjs');
 
+const { validAuditDirectory } = require('./audit-output.cjs');
+
 const CURRENT_SCHEMA_VERSION = 4;
 
 function freshState() {
@@ -142,6 +144,8 @@ function validStoredContract(contract, schemaVersion) {
     dependencyPolicy: value => SCOPE_POLICIES.has(value),
     allowedPaths: value => value === null || Array.isArray(value) && value.every(item => typeof item === 'string')
   };
+  if (contract.auditDirectory !== undefined && contract.auditDirectory !== null
+      && !validAuditDirectory(contract.auditDirectory)) return false;
   return Object.entries(checks).every(([key, check]) =>
     !Object.hasOwn(contract, key) && schemaVersion !== CURRENT_SCHEMA_VERSION || check(contract[key]));
 }

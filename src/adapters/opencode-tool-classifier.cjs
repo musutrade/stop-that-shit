@@ -1,5 +1,7 @@
 'use strict';
 
+const { auditWritePaths } = require('../audit-output.cjs');
+
 const { manifestEditDependencyIntent, manifestDependencyIntent, patchDependencyIntent } = require('../manifest-dependencies.cjs');
 const { analyzeShell, classifyShell } = require('../shell-analysis.cjs');
 
@@ -106,7 +108,8 @@ function analyzeOpenCodeTool(toolName, args, cwd) {
       hashIntent: detectHashIntent(toolName, args),
       dependencyIntent: detectDependencyIntent(toolName, args)
     };
-  return { ...analysis, affectedPaths: extractAffectedPaths(toolName, args, cwd, analysis.mutability) };
+  const auditPaths = auditWritePaths('opencode', toolName, args);
+  return { ...analysis, ...(auditPaths ? { auditWritePaths: auditPaths } : {}), affectedPaths: extractAffectedPaths(toolName, args, cwd, analysis.mutability) };
 }
 
 module.exports = {

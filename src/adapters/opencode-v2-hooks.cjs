@@ -1,5 +1,7 @@
 'use strict';
 
+const { auditWritePaths } = require('../audit-output.cjs');
+
 const { toActionEvent, toActionAfterEvent } = require('./opencode-hooks.cjs');
 
 function legacyInput(event) {
@@ -16,6 +18,10 @@ function toV2ActionEvent(event, context) {
   const result = toActionEvent(mapped.input, { args: mapped.args }, context);
   result.action.name = event.tool;
   result.action.input = event.input;
+  // Authorize from the raw V2 schema, never the lossy legacy alias mapping.
+  delete result.action.auditWritePaths;
+  const auditPaths = auditWritePaths('opencode-v2', event.tool, event.input);
+  if (auditPaths) result.action.auditWritePaths = auditPaths;
   return result;
 }
 

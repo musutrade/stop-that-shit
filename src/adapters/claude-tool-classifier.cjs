@@ -1,5 +1,7 @@
 'use strict';
 
+const { auditWritePaths } = require('../audit-output.cjs');
+
 const { manifestEditDependencyIntent, manifestDependencyIntent } = require('../manifest-dependencies.cjs');
 
 const nodePath = require('node:path');
@@ -162,7 +164,8 @@ function analyzeClaudeTool(toolName, toolInput, cwd) {
   // Claude's legacy path fallback uses the Codex tool-name classification.
   // Reuse it only for names with the same classification on both surfaces.
   const pathMutability = name === 'Bash' ? analysis.mutability : undefined;
-  return { ...analysis, affectedPaths: extractAffectedPaths(name, toolInput, cwd, pathMutability) };
+  const auditPaths = auditWritePaths('claude-code', name, toolInput);
+  return { ...analysis, ...(auditPaths ? { auditWritePaths: auditPaths } : {}), affectedPaths: extractAffectedPaths(name, toolInput, cwd, pathMutability) };
 }
 
 module.exports = {

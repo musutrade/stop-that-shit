@@ -405,7 +405,7 @@ function coordinatedUpdate(event, options, update) {
 
 function contractFields(contract, summary) {
   const limit = Number.isSafeInteger(contract.agentBudget) && contract.agentBudget >= 0 ? contract.agentBudget : DEFAULT_AGENT_LIMIT;
-  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}.`;
+  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}${contract.auditDirectory ? `; audit-dir=${contract.auditDirectory}` : ''}.`;
 }
 
 function contractContext(contract, delegation = {}, phase = 'active', directiveWarning = null, storageError = null) {
@@ -825,6 +825,7 @@ function handleBeforeAction(event, options) {
       reachability: event.action.reachability,
       authorization: event.action.authorization,
       affectedPaths: event.action.affectedPaths,
+      auditWritePaths: event.action.auditWritePaths,
       cwd: event.action.cwd,
       dependencyIntent: Boolean(event.action.dependencyIntent),
       unboundedDelegation: Boolean(event.action.unboundedDelegation),
@@ -1045,6 +1046,8 @@ module.exports = { contractContext, handleControlEvent, runtimeCommand };
 "src/contracts.cjs": function(module, exports, __require) {
 'use strict';
 
+const { validAuditDirectory } = __require("src/audit-output.cjs");
+
 const MODES = new Set(['answer', 'review', 'change', 'monitor', 'open']);
 const LEVELS = new Set(['watch', 'guard', 'lock', 'off']);
 const HASH_POLICIES = new Set(['deny', 'ask', 'allow']);
@@ -1058,6 +1061,7 @@ function defaultContract() {
     agentBudget: DEFAULT_AGENT_LIMIT,
     hashPolicy: 'deny',
     allowedPaths: null,
+    auditDirectory: null,
     dependencyPolicy: 'ask',
     source: 'default'
   };
@@ -1065,7 +1069,7 @@ function defaultContract() {
 
 function directiveHead(prompt, matchEnd) {
   const tail = prompt.slice(matchEnd).replace(/^[ \t]+/, '');
-  const boundaries = [tail.indexOf('--'), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
+  const boundaries = [tail.search(/(?:^|[ \t])--(?=[ \t]|$)/), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
     .filter((index) => index >= 0);
   const end = boundaries.length ? Math.min(...boundaries) : tail.length;
   return tail.slice(0, end).trim();
@@ -1137,6 +1141,17 @@ function parseDirective(prompt) {
     const files = /^files=(.*)$/i.exec(rawToken);
     if (files) {
       setField('allowedPaths', files[1].split('|').map((value) => value.replace(/\\/g, '/')).filter(Boolean), rawToken);
+      continue;
+    }
+    const audit = /^audit-dir=(.*)$/i.exec(rawToken);
+    if (audit) {
+      const directory = audit[1] === 'none' ? null : audit[1];
+      if (directory !== null && !validAuditDirectory(directory)) {
+        parsed.error = { code: 'INVALID_AUDIT_DIRECTORY', token: rawToken,
+          message: 'audit-dir requires one native absolute task directory without traversal, aliases, whitespace or wildcards; use none to revoke it.' };
+        break;
+      }
+      setField('auditDirectory', directory, rawToken);
       continue;
     }
     const dependencies = /^deps=(deny|ask|allow)$/.exec(token);
@@ -1315,6 +1330,9 @@ function narrowContract(parentContract, childContract) {
     agentBudget: Math.min(parent.agentBudget, child.agentBudget),
     hashPolicy: narrowerScalar(parent.hashPolicy, child.hashPolicy, POLICY_AUTHORITY),
     allowedPaths: narrowerPaths(parent.allowedPaths, child.allowedPaths),
+    // A child can inherit the same grant or revoke it, never create one.
+    auditDirectory: child.mode === 'review' && parent.auditDirectory === child.auditDirectory
+      ? child.auditDirectory : null,
     dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY)
   };
 }
@@ -1337,6 +1355,16 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
         warning: null,
         error: directive.error
       };
+    }
+    if (directive.auditDirectory && (directive.mode || next.mode) !== 'review') {
+      return { contract: previous, changed: false, directive: true, correction: false, warning: null,
+        error: { code: 'AUDIT_REQUIRES_REVIEW', message: 'audit-dir is an explicit review output exception; use it with review.' } };
+    }
+    // A new mode directive starts a new task boundary. Ordinary continuation
+    // prompts retain the grant; bare review and natural restrictions revoke it.
+    if (directive.mode || Object.hasOwn(directive, 'auditDirectory')) {
+      next.auditDirectory = directive.auditDirectory ?? null;
+      if (next.auditDirectory !== previous.auditDirectory) changed = true;
     }
     if (directive.mode && directive.mode !== next.mode) {
       next.mode = directive.mode;
@@ -1371,6 +1399,8 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
     }
     next.source = 'directive';
   } else if (correction) {
+    if (next.auditDirectory !== null) changed = true;
+    next.auditDirectory = null;
     if (correction.mode !== next.mode) {
       next.mode = correction.mode;
       changed = true;
@@ -1408,6 +1438,142 @@ module.exports = {
   normalizeContract,
   parseContractPrompt
 };
+
+},
+"src/audit-output.cjs": function(module, exports, __require) {
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+// A deliberately narrow, native-path grammar. No globbing, expansion, traversal,
+// quoting, Windows device/ADS aliases, or foreign-platform path interpretation.
+function safePath(value, absolute = false) {
+  if (typeof value !== 'string' || !value || /[\x00-\x20\x7f*?\[\]{}|,'"`$<>]/.test(value)) return false;
+  if (absolute && (!path.isAbsolute(value)
+      || process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(value))) return false;
+  if (process.platform !== 'win32' && /[\\:]/.test(value)) return false;
+  if (process.platform === 'win32' && (/^[\\/]{2}/.test(value) || /^[A-Za-z]:(?![\\/])/.test(value))) return false;
+  const rest = value.slice(path.parse(value).root.length);
+  return rest.split(/[\\/]/).every(part => part && part !== '.' && part !== '..'
+    && !/[. ]$/.test(part) && !part.includes(':')
+    && !/^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part));
+}
+
+function validAuditDirectory(value) {
+  return typeof value === 'string' && safePath(value, true)
+    && path.resolve(value) !== path.parse(path.resolve(value)).root;
+}
+
+function inside(directory, target) {
+  const relative = path.relative(directory, target);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function record(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function onlyKeys(value, keys) {
+  return Object.keys(value).every(key => keys.includes(key));
+}
+
+// This subset is intentionally smaller than the host's patch grammar. Reject
+// malformed/extended patches instead of extracting a reassuring partial list.
+function patchPaths(input) {
+  const patch = typeof input === 'string' ? input
+    : record(input) && onlyKeys(input, ['patch']) ? input.patch : null;
+  if (typeof patch !== 'string') return null;
+  const lines = patch.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n');
+  if (lines.shift() !== '*** Begin Patch' || lines.pop() !== '*** End Patch') return null;
+  const paths = [];
+  let operation = null;
+  let moveAllowed = false;
+  for (const line of lines) {
+    const header = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(line);
+    if (header) {
+      if (!safePath(header[2])) return null;
+      paths.push(header[2]);
+      operation = header[1];
+      moveAllowed = operation === 'Update';
+    } else if (line.startsWith('*** Move to: ') && moveAllowed) {
+      const destination = line.slice('*** Move to: '.length);
+      if (!safePath(destination)) return null;
+      paths.push(destination);
+      moveAllowed = false;
+    } else {
+      moveAllowed = false;
+      if (operation === 'Add' && line.startsWith('+')) continue;
+      if (operation === 'Update' && (/^[ +\-]/.test(line) || /^@@(?: .*)?$/.test(line) || line === '*** End of File')) continue;
+      return null;
+    }
+  }
+  return paths.length ? paths : null;
+}
+
+function auditWritePaths(host, name, input) {
+  if (host === 'codex' && name === 'apply_patch') return patchPaths(input);
+  if (host === 'opencode' || host === 'opencode-v2') {
+    const patchName = host === 'opencode' ? 'apply_patch' : 'patch';
+    if (!record(input)) return null;
+    if (name === patchName) return onlyKeys(input, ['patchText']) ? patchPaths(input.patchText) : null;
+    if (!['write', 'edit'].includes(name)) return null;
+    const field = host === 'opencode' ? 'filePath' : 'path';
+    const keys = name === 'write' ? [field, 'content'] : [field, 'oldString', 'newString', 'replaceAll'];
+    if (!onlyKeys(input, keys) || !safePath(input[field], true)) return null;
+    if (name === 'write' ? typeof input.content !== 'string'
+      : typeof input.oldString !== 'string' || typeof input.newString !== 'string'
+        || input.replaceAll !== undefined && typeof input.replaceAll !== 'boolean') return null;
+    return [input[field]];
+  }
+  if (host !== 'claude-code' || !['Write', 'Edit'].includes(name) || !record(input)) return null;
+  const keys = name === 'Write' ? ['file_path', 'content'] : ['file_path', 'old_string', 'new_string', 'replace_all'];
+  if (!onlyKeys(input, keys) || !safePath(input.file_path, true)) return null;
+  if (name === 'Write' ? typeof input.content !== 'string'
+    : typeof input.old_string !== 'string' || typeof input.new_string !== 'string'
+      || input.replace_all !== undefined && typeof input.replace_all !== 'boolean') return null;
+  return [input.file_path];
+}
+
+// Check every existing component, including the root's ancestors. A missing
+// descendant is fine for a host that creates parents; any other I/O error denies.
+function inspectPath(target, requireDirectory = false) {
+  const root = path.parse(target).root;
+  const parts = target.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+  for (let index = 0; index < parts.length; index++) {
+    current = path.join(current, parts[index]);
+    let stat;
+    try { stat = fs.lstatSync(current); }
+    catch (error) { return error.code === 'ENOENT' && !requireDirectory; }
+    if (stat.isSymbolicLink()) return false;
+    const directory = requireDirectory || index < parts.length - 1;
+    if (directory ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1) return false;
+  }
+  return true;
+}
+
+function allowsAuditWrite(contract, action) {
+  if (contract.mode !== 'review' || !validAuditDirectory(contract.auditDirectory)
+      || action.mutability !== 'write' || !Array.isArray(action.auditWritePaths)
+      || action.auditWritePaths.length === 0) return false;
+  // cwd is a host location, not a directive token. Spaces and trailing
+  // separators are valid here; require a fully qualified native path only.
+  if (typeof action.cwd !== 'string' || action.cwd.includes('\0') || !path.isAbsolute(action.cwd)
+      || process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(action.cwd)) return false;
+  try {
+    if (!inspectPath(path.resolve(contract.auditDirectory), true)) return false;
+    // Compare filesystem identities, not cwd spelling: a symlink/short-name
+    // alias for the worktree must not turn the whole worktree writable.
+    const directory = fs.realpathSync.native(contract.auditDirectory);
+    const cwd = fs.realpathSync.native(action.cwd);
+    if (!fs.statSync(cwd).isDirectory() || path.relative(directory, cwd) === '' || inside(directory, cwd)) return false;
+    return action.auditWritePaths.every(raw => safePath(raw)
+      && inside(directory, path.resolve(cwd, raw)) && inspectPath(path.resolve(cwd, raw)));
+  } catch { return false; }
+}
+
+module.exports = { allowsAuditWrite, auditWritePaths, validAuditDirectory };
 
 },
 "src/delegation-state.cjs": function(module, exports, __require) {
@@ -1681,6 +1847,7 @@ module.exports = {
 "src/decision.cjs": function(module, exports, __require) {
 'use strict';
 
+const { allowsAuditWrite } = __require("src/audit-output.cjs");
 const nodePath = require('node:path');
 const { DEFAULT_AGENT_LIMIT } = __require("src/contracts.cjs");
 const { inspectDelegation } = __require("src/delegation-state.cjs");
@@ -1774,7 +1941,7 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
   }
 
   const nonMutatingMode = ['answer', 'review', 'monitor'].includes(mode);
-  if (nonMutatingMode && action.mutability === 'write') {
+  if (nonMutatingMode && action.mutability === 'write' && !allowsAuditWrite(contract, action)) {
     return decision(
       controlledOutcome(level),
       'I',
@@ -2606,6 +2773,8 @@ const {
   defaultContract, normalizeContract, MODES, LEVELS, HASH_POLICIES, SCOPE_POLICIES
 } = __require("src/contracts.cjs");
 
+const { validAuditDirectory } = __require("src/audit-output.cjs");
+
 const CURRENT_SCHEMA_VERSION = 4;
 
 function freshState() {
@@ -2744,6 +2913,8 @@ function validStoredContract(contract, schemaVersion) {
     dependencyPolicy: value => SCOPE_POLICIES.has(value),
     allowedPaths: value => value === null || Array.isArray(value) && value.every(item => typeof item === 'string')
   };
+  if (contract.auditDirectory !== undefined && contract.auditDirectory !== null
+      && !validAuditDirectory(contract.auditDirectory)) return false;
   return Object.entries(checks).every(([key, check]) =>
     !Object.hasOwn(contract, key) && schemaVersion !== CURRENT_SCHEMA_VERSION || check(contract[key]));
 }
@@ -3844,6 +4015,7 @@ function policyDigest(contract) {
     level: contract.level,
     hashPolicy: contract.hashPolicy,
     dependencyPolicy: contract.dependencyPolicy,
+    auditDirectory: contract.auditDirectory ?? null,
     allowedPaths: contract.allowedPaths === null ? null : Array.isArray(contract.allowedPaths) ? [...contract.allowedPaths].sort() : undefined
   };
   if (Object.values(bound).some(value => value === undefined)) return null;
@@ -4363,6 +4535,8 @@ module.exports = { manifestDependencyIntent, manifestEditDependencyIntent, patch
 "src/adapters/codex-tool-classifier.cjs": function(module, exports, __require) {
 'use strict';
 
+const { auditWritePaths } = __require("src/audit-output.cjs");
+
 const nodePath = require('node:path');
 const { analyzeShell, analyzeShellInput, classifyShell } = __require("src/shell-analysis.cjs");
 const { patchDependencyIntent } = __require("src/manifest-dependencies.cjs");
@@ -4452,7 +4626,8 @@ function analyzeCodexTool(toolName, toolInput, cwd) {
       dependencyIntent: detectDependencyIntent(name, toolInput)
     };
   }
-  return { ...analysis, affectedPaths: extractAffectedPaths(name, toolInput, cwd) };
+  const auditPaths = auditWritePaths('codex', name, toolInput);
+  return { ...analysis, ...(auditPaths ? { auditWritePaths: auditPaths } : {}), affectedPaths: extractAffectedPaths(name, toolInput, cwd) };
 }
 
 module.exports = { analyzeCodexTool, analyzeShell, canonicalCodexToolName, classifyCodexTool, classifyShell, detectDependencyIntent, detectHashIntent, extractAffectedPaths };

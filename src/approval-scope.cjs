@@ -93,6 +93,7 @@ function policyDigest(contract) {
     level: contract.level,
     hashPolicy: contract.hashPolicy,
     dependencyPolicy: contract.dependencyPolicy,
+    auditDirectory: contract.auditDirectory ?? null,
     allowedPaths: contract.allowedPaths === null ? null : Array.isArray(contract.allowedPaths) ? [...contract.allowedPaths].sort() : undefined
   };
   if (Object.values(bound).some(value => value === undefined)) return null;
