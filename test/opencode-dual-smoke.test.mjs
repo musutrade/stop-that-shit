@@ -31,6 +31,8 @@ for (const version of ['V1', 'V2']) {
     else t.diagnostic(`Evidence directory: ${work}`);
     const workspace = path.join(work, 'workspace');
     fs.mkdirSync(workspace);
+    const init = await command('git', ['init', '-q', workspace], { cwd: work });
+    assert.equal(init.status, 0, init.stderr);
     fs.writeFileSync(path.join(workspace, 'read.txt'), 'STS_READ_SUCCEEDED');
     fs.writeFileSync(path.join(workspace, 'restart-read.txt'), 'STS_RESTART_READ_SUCCEEDED');
     const dataDir = path.join(work, 'sts-data');
@@ -111,6 +113,16 @@ for (const version of ['V1', 'V2']) {
     };
     fs.mkdirSync(path.join(env.XDG_CONFIG_HOME, 'opencode'), { recursive: true });
     fs.writeFileSync(path.join(env.XDG_CONFIG_HOME, 'opencode/opencode.json'), JSON.stringify(config, null, 2));
+    if (version === 'V1') {
+      // V1 bootstraps this exact SDK through its embedded npm implementation.
+      // Prepare the same prerequisite with the configured npm CLI so native
+      // acceptance does not depend on a second background package installer.
+      const sdkVersion = hostVersion.stdout.trim().match(/1\.\d+\.\d+$/)[0];
+      const bootstrap = await command(process.execPath, [npmCli, 'install', '--prefix', path.join(env.XDG_CONFIG_HOME, 'opencode'),
+        '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', `@opencode-ai/plugin@${sdkVersion}`], { cwd: work });
+      fs.writeFileSync(path.join(work, 'sdk-bootstrap.log'), bootstrap.stdout + bootstrap.stderr);
+      assert.equal(bootstrap.status, 0, bootstrap.stderr);
+    }
     const sessionIDs = (stdout) => stdout.split(/\r?\n/).filter(Boolean).flatMap((line) => {
       try { const id = JSON.parse(line).sessionID; return id ? [id] : []; } catch { return []; }
     });
