@@ -15,11 +15,13 @@ const root = path.join(__dirname, '..');
 // in-process HTTP server.
 function runOpencode(args, options = {}) {
   return new Promise((resolve) => {
+    const { input, ...spawnOptions } = options;
     const child = spawn('opencode', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       timeout: 180000,
-      ...options
+      ...spawnOptions
     });
+    if (input !== undefined) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
@@ -37,6 +39,8 @@ test('installed OpenCode plugin denies a write under a review contract', { skip:
   t.after(() => fs.rmSync(work, { recursive: true, force: true }));
   const workspace = path.join(work, 'ws');
   fs.mkdirSync(workspace, { recursive: true });
+  const init = spawnSync('git', ['init', '-q', workspace], { cwd: work, encoding: 'utf8' });
+  assert.equal(init.status, 0, init.stderr);
   const blockedPath = path.join(workspace, 'blocked.txt');
   const configDir = path.join(work, 'config');
   const dataDir = path.join(work, 'data');
@@ -91,15 +95,25 @@ test('installed OpenCode plugin denies a write under a review contract', { skip:
     NO_COLOR: '1'
   });
 
+  // Match V1's native SDK prerequisite without its background embedded npm
+  // bootstrap; the actual packed-plugin and tool-result assertions stay below.
+  const sdkVersion = versionProbe.stdout.trim().match(/1\.\d+\.\d+$/)?.[0];
+  assert.ok(sdkVersion, 'This legacy smoke requires OpenCode V1; use test:hosts for V2.');
+  const bootstrap = spawnSync('npm', ['install', '--prefix', path.join(configDir, 'opencode'),
+    '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', `@opencode-ai/plugin@${sdkVersion}`],
+  { env, cwd: work, encoding: 'utf8', timeout: 120000 });
+  assert.equal(bootstrap.status, 0, bootstrap.stderr || bootstrap.stdout);
+
   const install = await runOpencode(['plugin', `file:${tarball}`, '-g'], { env });
   assert.equal(install.status, 0, `plugin install failed:\n${install.stdout}\n${install.stderr}`);
 
   const run = await runOpencode([
     'run',
     '--dir', workspace,
-    '--print-logs',
-    '$stop-that-shit review -- Create blocked.txt with content denied.'
-  ], { env });
+    '--print-logs'
+  // V1 quotes positional prompts containing spaces. Stdin preserves the root
+  // directive, matching the dedicated dual-version host acceptance path.
+  ], { env, input: '$stop-that-shit review -- Create blocked.txt with content denied.' });
   const combined = `${run.stdout}\n${run.stderr}`;
 
   assert.ok(llm.requests.length >= 1, `the fake model received no request:\n${combined}`);

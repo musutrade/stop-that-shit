@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { Effect, Exit, PubSub, Scope, Stream } from 'effect';
 import * as entry from '../opencode/stop-that-shit.mjs';
-import { acquireSessionLock, readState, statePath } from '../src/state.cjs';
+import { acquireSessionLock, readState, statePath, updateSession } from '../src/state.cjs';
 
 async function host(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sts-opencode-v2-'));
@@ -47,6 +47,35 @@ const write = (id = 'call-write', sessionID = 'root', file = '/repo/a.txt') => (
   tool: 'write', id, sessionID, agent: 'build', messageID: 'assistant-1', input: { path: file, content: 'hello' },
 });
 const user = (id, text) => ({ type: 'user', id, text, time: { created: 1 } });
+
+for (const granted of [false, true]) {
+  test(`CrewMoor envelopes preserve V2 review and its audit boundary (grant=${granted})`, async t => {
+    const h = await host(t);
+    const cwd = path.join(h.dataDir, 'workspace'), output = path.join(h.dataDir, 'output');
+    for (const directory of [cwd, output, path.join(cwd, '.git')]) fs.mkdirSync(directory);
+    h.sessions.get('root').location.directory = cwd;
+    h.messages.get('root').push(user('initial', `$stop-that-shit review${granted ? ` audit-dir="${output}"` : ''} -- inspect only`));
+    const before = file => h.run(Effect.result(h.hooks.tool['execute.before'](write('write-1', 'root', file))));
+    assert.equal((await before(path.join(cwd, 'code.js')))._tag, 'Failure');
+    const prior = readState('root', h.dataDir).contract;
+    h.messages.get('root').push(user('business', JSON.stringify({ team: 'owned', message: { id: 'business-1', from: 'dispatcher',
+      to: 'audit', reply_to: null, content: 'Continue the audit and report findings.' } })));
+    assert.equal((await before(path.join(cwd, 'code.js')))._tag, 'Failure');
+    assert.deepEqual(readState('root', h.dataDir).contract, prior);
+    assert.equal(prior.mode, 'review');
+    assert.equal((await before(path.join(output, 'report.md')))._tag, granted ? 'Success' : 'Failure');
+  });
+}
+
+test('only the CrewMoor envelope shape excludes JSON prompts from host promotion', async t => {
+  const { allowsHostPromotion } = await import('../opencode/runtime.mjs');
+  for (const envelope of [{ team: 'owned', message: {} }, { message: null, team: 'owned', extra: true }]) {
+    assert.equal(allowsHostPromotion(JSON.stringify(envelope), { mode: 'review' }), false);
+  }
+  for (const prompt of ['Now implement the fix.', JSON.stringify({ instruction: 'Implement the fix.' })]) {
+    assert.equal(allowsHostPromotion(prompt, { mode: 'review' }), true);
+  }
+});
 
 test('V2 ordinary tool results return watch context without rewriting session state', async t => {
   const h = await host(t);
@@ -147,10 +176,15 @@ test('V2 follows an editable host agent for a new plain root prompt but not a qu
   const before = () => h.run(Effect.result(h.hooks.tool['execute.before'](write())));
   h.messages.get('root').push(user('msg_001', '$stop-that-shit review'));
   assert.equal((await before())._tag, 'Failure');
+  updateSession('root', h.dataDir, state => {
+    state.contract.auditOutput = { directory: path.join(h.dataDir, 'output'), workspace: path.join(h.dataDir, 'workspace') };
+  });
   h.messages.get('root').push(user('msg_002', 'Explain `$stop-that-shit change` to me.'));
   assert.equal((await before())._tag, 'Failure');
   h.messages.get('root').push(user('msg_003', 'Now implement the fix.'));
   assert.equal((await before())._tag, 'Success');
+  assert.equal(readState('root', h.dataDir).contract.auditOutput, null);
+  assert.equal(readState('root', h.dataDir).contract.reportBinding, null);
 });
 
 for (const instruction of ['review only; do not edit anything', '只审查，不要修改任何文件']) {

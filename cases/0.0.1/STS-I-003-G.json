@@ -1,0 +1,13 @@
+{
+  "id": "STS-I-003-G",
+  "kind": "good",
+  "family": "I",
+  "title": "An explicit external audit grant permits the same review artifact",
+  "sourceIssue": "https://github.com/musutrade/stop-that-shit/issues/1",
+  "fixture": "external-audit",
+  "input": {
+    "contract": { "mode": "review", "level": "guard", "auditOutput": { "directory": "$AUDIT_DIRECTORY", "workspace": "$AUDIT_WORKSPACE" } },
+    "action": { "mutability": "write", "hostFamily": "codex", "name": "Write", "cwd": "$AUDIT_WORKSPACE", "input": { "file_path": "$AUDIT_REPORT" }, "affectedPaths": ["$AUDIT_REPORT"] }
+  },
+  "expected": { "outcome": "allow", "family": null, "reasonCode": "WITHIN_CONTRACT" }
+}

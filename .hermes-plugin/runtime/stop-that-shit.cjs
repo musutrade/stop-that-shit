@@ -369,7 +369,7 @@ function handlePromptStorageFailure(event, options, error) {
     return context(`SESSION_STATE_UNAVAILABLE (${storageErrorCode(readError)}): this prompt result could not be confirmed. Check $stop-that-shit status before relying on a contract change.`);
   }
   if (state.storageError) return context(`${state.storageError.code}: ${state.storageError.message}`);
-  const parsed = parseContractPrompt(event.prompt, state.contract);
+  const parsed = parseContractPrompt(event.prompt, state.contract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
   if (parsed.error) return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
   if (parsed.changed) return contractUpdateFailure(error);
   if (parsed.directive || parsed.correction) {
@@ -405,7 +405,7 @@ function coordinatedUpdate(event, options, update) {
 
 function contractFields(contract, summary) {
   const limit = Number.isSafeInteger(contract.agentBudget) && contract.agentBudget >= 0 ? contract.agentBudget : DEFAULT_AGENT_LIMIT;
-  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}.`;
+  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}${contract.auditOutput ? '; audit-dir=' + contract.auditOutput.directory : ''}${contract.reportBinding ? '; report-binding=' + contract.reportBinding.path : ''}.`;
 }
 
 function contractContext(contract, delegation = {}, phase = 'active', directiveWarning = null, storageError = null) {
@@ -545,12 +545,20 @@ function widensFileBoundary(previous, next) {
 function handlePrompt(event, state) {
   if (state.storageError) return context(`${state.storageError.code}: ${state.storageError.message}`);
   const previousContract = state.scope?.child ? state.childContract : state.contract;
-  const parsed = parseContractPrompt(event.prompt, previousContract);
+  const parsed = parseContractPrompt(event.prompt, previousContract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
   if (parsed.error) {
     state.directiveError = parsed.error;
     state.directiveWarning = null;
     state.lastPromptContext = null;
     return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
+  }
+  if (state.scope?.child && (parsed.contract.auditOutput
+      && !__require("src/review-audit.cjs").narrowedDirectory(state.contract.auditOutput, parsed.contract.auditOutput)
+      || parsed.contract.reportBinding && !__require("src/review-audit.cjs").sameBinding(state.contract.reportBinding, parsed.contract.reportBinding))) {
+    state.directiveError = { code: 'AUDIT_BOUNDARY_WIDEN', message: 'A subagent cannot add, widen or redirect inherited audit authority.' };
+    state.directiveWarning = null;
+    state.lastPromptContext = null;
+    return { kind: 'prompt-error', error: state.directiveError, message: state.directiveError.message };
   }
   if (state.scope?.child && widensFileBoundary(state.contract.allowedPaths, parsed.contract.allowedPaths)
       && parsed.contract.allowedPaths !== previousContract.allowedPaths) {
@@ -625,7 +633,7 @@ function handleScopedPrompt(event, options) {
     // lacks the host's real child-state API. Contract changes fail closed;
     // ordinary child conversation remains read-only.
     const parent = readState(event.sessionId, options.dataDir);
-    const parsed = parseContractPrompt(event.prompt, parent.contract);
+    const parsed = parseContractPrompt(event.prompt, parent.contract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
     if (parsed.error) return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
     if (parsed.directive || parsed.correction || /<send_user_message_question_reply>/.test(event.prompt)) {
       return { kind: 'prompt-error', error: { code: 'CHILD_SCOPE_UNAVAILABLE' },
@@ -817,6 +825,11 @@ function handleBeforeAction(event, options) {
     const actionChangesDelegation = event.action.mutability === 'delegate'
       || delegationLifecycleUnproven || legacyDelegationProtocol;
     const action = {
+      name: event.action.name,
+      input: event.action.input,
+      hostFamily: event.host?.family,
+      nativeSessionId: event.sourceSessionId || event.sessionId,
+      child: Boolean(state.scope?.child),
       mutability: event.action.mutability,
       analysisReason: event.action.analysisReason,
       legacyDelegationProtocol,
@@ -1045,6 +1058,8 @@ module.exports = { contractContext, handleControlEvent, runtimeCommand };
 "src/contracts.cjs": function(module, exports, __require) {
 'use strict';
 
+const audit = __require("src/review-audit.cjs");
+
 const MODES = new Set(['answer', 'review', 'change', 'monitor', 'open']);
 const LEVELS = new Set(['watch', 'guard', 'lock', 'off']);
 const HASH_POLICIES = new Set(['deny', 'ask', 'allow']);
@@ -1059,16 +1074,23 @@ function defaultContract() {
     hashPolicy: 'deny',
     allowedPaths: null,
     dependencyPolicy: 'ask',
+    auditOutput: null,
+    reportBinding: null,
     source: 'default'
   };
 }
 
 function directiveHead(prompt, matchEnd) {
   const tail = prompt.slice(matchEnd).replace(/^[ \t]+/, '');
-  const boundaries = [tail.indexOf('--'), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
-    .filter((index) => index >= 0);
-  const end = boundaries.length ? Math.min(...boundaries) : tail.length;
-  return tail.slice(0, end).trim();
+  let quote = null;
+  for (let index = 0; index < tail.length; index++) {
+    const char = tail[index];
+    if (quote) { if (char === quote) quote = null; continue; }
+    if (char === '"' || char === "'") { quote = char; continue; }
+    if (char === '\n' || char === ':' && /\s|^$/.test(tail[index + 1] || '')
+        || tail.slice(index, index + 2) === '--' && (index === 0 || /\s/.test(tail[index - 1]))) return tail.slice(0, index).trim();
+  }
+  return tail.trim();
 }
 
 function parseDirective(prompt) {
@@ -1078,8 +1100,14 @@ function parseDirective(prompt) {
   if (!mention) return null;
 
   const head = directiveHead(prompt, mention.index + mention[0].length);
-  const tokens = head.split(/[\s,]+/).map((token) => token.trim()).filter(Boolean);
+  const tokens = head.match(/(?:[^\s,"']+|"[^"]*"|'[^']*')+/g) || [];
   const parsed = { mentioned: true, error: null, warning: null };
+  let quote = null;
+  for (const char of head) {
+    if (quote) { if (char === quote) quote = null; }
+    else if (char === '"' || char === "'") quote = char;
+  }
+  if (quote) return { ...parsed, error: { code: 'INVALID_DIRECTIVE_TOKEN', message: 'Unclosed directive field quote.' } };
 
   function setField(field, value, token) {
     if (Object.hasOwn(parsed, field) && JSON.stringify(parsed[field]) !== JSON.stringify(value)) {
@@ -1142,6 +1170,13 @@ function parseDirective(prompt) {
     const dependencies = /^deps=(deny|ask|allow)$/.exec(token);
     if (dependencies && SCOPE_POLICIES.has(dependencies[1])) {
       setField('dependencyPolicy', dependencies[1], rawToken);
+      continue;
+    }
+    const auditField = /^(audit-dir|report-binding)=(.*)$/i.exec(rawToken);
+    if (auditField) {
+      let value = auditField[2];
+      if (/^["']/.test(value) && value.at(-1) === value[0]) value = value.slice(1, -1);
+      setField(auditField[1].toLowerCase() === 'audit-dir' ? 'auditDirectory' : 'reportBindingPath', value, rawToken);
       continue;
     }
     parsed.error = {
@@ -1251,6 +1286,8 @@ function normalizeContract(previousContract) {
   delete previous.totalAgentBudget;
   delete previous.concurrentAgentBudget;
   delete previous.agentsUsed;
+  previous.auditOutput = audit.validAuditDirectory(supplied.auditOutput ?? null) ? supplied.auditOutput ?? null : null;
+  previous.reportBinding = previous.auditOutput && audit.validReportBinding(supplied.reportBinding ?? null) ? supplied.reportBinding ?? null : null;
   return previous;
 }
 
@@ -1308,18 +1345,22 @@ function narrowContract(parentContract, childContract) {
   if (child.source === 'default' && Object.keys(defaults).every(key => child[key] === defaults[key])) {
     return { ...parent };
   }
+  const mode = narrowerScalar(parent.mode, child.mode, MODE_AUTHORITY);
+  const auditOutput = mode === 'review' ? audit.narrowedDirectory(parent.auditOutput, child.auditOutput) : null;
   return {
     ...child,
-    mode: narrowerScalar(parent.mode, child.mode, MODE_AUTHORITY),
+    mode,
     level: narrowerScalar(parent.level, child.level, LEVEL_AUTHORITY),
     agentBudget: Math.min(parent.agentBudget, child.agentBudget),
     hashPolicy: narrowerScalar(parent.hashPolicy, child.hashPolicy, POLICY_AUTHORITY),
     allowedPaths: narrowerPaths(parent.allowedPaths, child.allowedPaths),
-    dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY)
+    dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY),
+    auditOutput,
+    reportBinding: auditOutput && audit.sameBinding(parent.reportBinding, child.reportBinding) ? child.reportBinding : null
   };
 }
 
-function parseContractPrompt(prompt, previousContract = defaultContract()) {
+function parseContractPrompt(prompt, previousContract = defaultContract(), context = {}) {
   const previous = normalizeContract(previousContract);
   const text = String(prompt || '');
   const directive = parseDirective(text);
@@ -1362,6 +1403,12 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
       next.dependencyPolicy = directive.dependencyPolicy;
       changed = true;
     }
+    // Every explicit task mode starts a new grant lifetime, even another review.
+    if (directive.mode || directive.level === 'off' || directive.level === 'watch') {
+      if (next.auditOutput || next.reportBinding) changed = true;
+      next.auditOutput = null;
+      next.reportBinding = null;
+    }
     if (directive.mode && !directive.level && next.level === 'watch') {
       next.level = 'guard';
       changed = true;
@@ -1369,8 +1416,27 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
     if (directive.level === 'off') {
       next.level = 'off';
     }
+    if (Object.hasOwn(directive, 'auditDirectory') || Object.hasOwn(directive, 'reportBindingPath')) {
+      try {
+        if (next.mode !== 'review' || !['guard', 'lock'].includes(next.level)) throw new Error('Audit grants require enforcing review mode');
+        if (Object.hasOwn(directive, 'auditDirectory')) {
+          next.auditOutput = directive.auditDirectory === 'none' ? null : audit.auditDirectory(directive.auditDirectory, context.cwd || process.cwd());
+          // A changed output boundary never retains a dormant message grant.
+          next.reportBinding = null;
+        }
+        if (Object.hasOwn(directive, 'reportBindingPath')) next.reportBinding = directive.reportBindingPath === 'none'
+          ? null : audit.reportBinding(directive.reportBindingPath, context, next.auditOutput);
+        changed = true;
+      } catch (error) {
+        return { contract: previous, changed: false, directive: true, correction: Boolean(correction), warning: null,
+          error: { code: 'INVALID_AUDIT_GRANT', message: error.message } };
+      }
+    }
     next.source = 'directive';
   } else if (correction) {
+    if (next.auditOutput || next.reportBinding) changed = true;
+    next.auditOutput = null;
+    next.reportBinding = null;
     if (correction.mode !== next.mode) {
       next.mode = correction.mode;
       changed = true;
@@ -1408,6 +1474,552 @@ module.exports = {
   normalizeContract,
   parseContractPrompt
 };
+
+},
+"src/review-audit.cjs": function(module, exports, __require) {
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { directCommandArguments } = __require("src/shell-analysis.cjs");
+const { inputText } = __require("src/tool-input.cjs");
+
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const text = value => typeof value === 'string' && value.length > 0;
+const inside = (root, target) => {
+  const relative = path.relative(root, target);
+  return relative === '' || !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+};
+
+// Check the original spelling before resolving: normalization would conceal a
+// symlink followed by '..'. This is a static check, not filesystem confinement.
+function validPathSpelling(value, platform = process.platform) {
+  if (!text(value) || /[\0\r\n]/.test(value)) return false;
+  const parts = value.split(/[\\/]/);
+  if (parts.includes('..')) return false;
+  // Win32 removes trailing dots/spaces from components, including '.. '. Do
+  // not let lexical containment authorize a different filesystem destination.
+  return platform !== 'win32' || !parts.some(part => part !== '.' && /[. ]$/.test(part));
+}
+
+function checkedPath(value, cwd, { directory = false, newFile = false } = {}) {
+  if (!validPathSpelling(value) || cwd != null && !validPathSpelling(cwd)) throw new Error('Unproven path');
+  if (process.platform !== 'win32' && (/^[A-Za-z]:[\\/]|^\\/.test(value) || value.includes('\\'))) throw new Error('Foreign path');
+  if (!path.isAbsolute(value) && !path.isAbsolute(cwd || '')) throw new Error('Missing absolute cwd');
+  const target = path.resolve(cwd || '', value);
+  const root = path.parse(target).root;
+  const parts = target.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+  for (let i = 0; i < parts.length; i++) {
+    current = path.join(current, parts[i]);
+    let stat;
+    try { stat = fs.lstatSync(current); }
+    catch (error) {
+      if (newFile && !directory && error.code === 'ENOENT' && i === parts.length - 1) return target;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error('Symlink path');
+    if (i < parts.length - 1 || directory) {
+      if (!stat.isDirectory()) throw new Error('Not a directory');
+    } else if (!stat.isFile() || stat.nlink !== 1) throw new Error('Not a private regular file');
+  }
+  if (!parts.length && !directory) throw new Error('Not a file');
+  return fs.realpathSync(target);
+}
+
+function workspaceRoot(cwd) {
+  const current = checkedPath(cwd, null, { directory: true });
+  let parent = current;
+  while (true) {
+    if (fs.existsSync(path.join(parent, '.git'))) return parent;
+    const next = path.dirname(parent);
+    if (next === parent) return current;
+    parent = next;
+  }
+}
+
+function auditDirectory(value, cwd) {
+  if (!path.isAbsolute(value || '')) throw new Error('audit-dir must be absolute');
+  const directory = checkedPath(value, null, { directory: true });
+  const workspace = workspaceRoot(cwd);
+  if (inside(workspace, directory) || inside(directory, workspace)) throw new Error('audit-dir must be disjoint from the workspace');
+  return { directory, workspace };
+}
+
+function executablePath(program) {
+  const candidates = path.isAbsolute(program) ? [program] : program === path.basename(program)
+    ? (process.env.PATH || '').split(path.delimiter).filter(Boolean).flatMap(dir =>
+      process.platform === 'win32' ? [path.join(dir, program), path.join(dir, `${program}.exe`)] : [path.join(dir, program)]) : [];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return fs.realpathSync(candidate);
+    } catch {}
+  }
+  throw new Error('CrewMoor executable is unavailable');
+}
+
+function bindingIdentity(binding) {
+  if (!record(binding) || !text(binding.team) || !record(binding.config)) throw new Error('Invalid binding');
+  const endpoints = ['worker', 'dispatcher'].map(side => {
+    const endpoint = binding[side], config = binding.config[side];
+    const registration = endpoint?.context?.registration;
+    if (!record(endpoint) || !record(config) || !record(registration)
+        || registration.team !== binding.team || !text(registration.role) || !text(registration.task)
+        || !text(registration.agent) || !text(endpoint.native_session)
+        || !text(endpoint.context.instance) || config.instance !== endpoint.context.instance
+        || !text(endpoint.handle) || config.handle !== endpoint.handle) throw new Error('Incomplete binding identity');
+    return { ...registration, session: endpoint.native_session, instance: endpoint.context.instance };
+  });
+  const [worker, dispatcher] = endpoints;
+  if (worker.role === dispatcher.role || worker.instance === dispatcher.instance
+      || worker.session === dispatcher.session || worker.task !== dispatcher.task) throw new Error('Binding endpoints must be distinct and task bound');
+  return { worker, dispatcher };
+}
+
+function reportBinding(value, context, output) {
+  if (!path.isAbsolute(value || '') || !output) throw new Error('report-binding requires audit-dir and an absolute binding path');
+  const file = checkedPath(value);
+  if (inside(output.directory, file)) throw new Error('Binding configuration must be outside audit-dir');
+  const binding = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const { worker } = bindingIdentity(binding);
+  const family = context.hostFamily === 'claude-code' ? 'claude' : context.hostFamily;
+  if (!text(context.sessionId) || worker.session !== context.sessionId || worker.agent !== family
+      || checkedPath(worker.cwd, null, { directory: true }) !== checkedPath(context.cwd, null, { directory: true })) {
+    throw new Error('Binding does not identify this native host/session/cwd');
+  }
+  return { path: file, executable: executablePath('crewmoor'), snapshot: JSON.stringify(binding) };
+}
+
+function validAuditDirectory(value) {
+  return value === null || record(value) && path.isAbsolute(value.directory || '') && path.isAbsolute(value.workspace || '')
+    && !inside(value.directory, value.workspace) && !inside(value.workspace, value.directory);
+}
+
+function validReportBinding(value) {
+  if (value === null) return true;
+  if (!record(value) || !path.isAbsolute(value.path || '') || !path.isAbsolute(value.executable || '') || !text(value.snapshot)) return false;
+  try { bindingIdentity(JSON.parse(value.snapshot)); return true; } catch { return false; }
+}
+
+function narrowedDirectory(parent, child) {
+  if (!parent || !child || parent.workspace !== child.workspace || !inside(parent.directory, child.directory)) return null;
+  return child;
+}
+
+function sameBinding(parent, child) {
+  return Boolean(parent && child && parent.path === child.path && parent.executable === child.executable && parent.snapshot === child.snapshot);
+}
+
+function fileTargets(action) {
+  const { hostFamily: host, name, input } = action;
+  if ((host === 'codex' || host === 'claude-code') && ['Write', 'Edit'].includes(name)) return [input?.file_path || input?.path];
+  if (host === 'opencode' && ['write', 'edit'].includes(name)) return [input?.filePath || input?.path];
+  if ((host === 'codex' && name === 'apply_patch') || host === 'opencode' && ['apply_patch', 'patch'].includes(name)) {
+    const patch = host === 'codex' ? inputText(input)
+      : typeof input === 'string' ? input : input?.patchText || input?.patch || input?.input || '';
+    if (typeof patch !== 'string' || /^\*\*\* (?:Delete File:|Move to:)/m.test(patch)) return null;
+    return [...patch.matchAll(/^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$/gm)].map(match => match[1]);
+  }
+  return null;
+}
+
+function artifactPath(value, output, cwd, newFile = false) {
+  if (checkedPath(output.directory, null, { directory: true }) !== output.directory
+      || checkedPath(output.workspace, null, { directory: true }) !== output.workspace) throw new Error('Grant path changed');
+  const file = checkedPath(value, cwd, { newFile });
+  if (!inside(output.directory, file) || file === output.directory) throw new Error('Outside audit-dir');
+  return file;
+}
+
+function authorizeAuditAction(contract, action) {
+  if (contract.mode !== 'review' || !['guard', 'lock'].includes(contract.level) || !contract.auditOutput) return false;
+  try {
+    const targets = fileTargets(action);
+    if (action.mutability === 'write' && targets?.length) {
+      for (const target of targets) artifactPath(target, contract.auditOutput, action.cwd, true);
+      return true;
+    }
+    const shell = action.hostFamily === 'codex' && ['Bash', 'exec_command', 'shell_command'].includes(action.name)
+      || action.hostFamily === 'claude-code' && action.name === 'Bash'
+      || action.hostFamily === 'opencode' && ['bash', 'shell'].includes(action.name);
+    if (!shell || !contract.reportBinding) return false;
+    const input = action.input;
+    if (!record(input) || input.shell != null || input.env != null || input.run_in_background
+        || input.command != null && input.cmd != null && input.command !== input.cmd
+        || input.workdir != null && checkedPath(input.workdir, null, { directory: true }) !== checkedPath(action.cwd, null, { directory: true })) return false;
+    // An argv/env wrapper can change the executed operation; only the literal
+    // command field of a native shell tool is part of this exception.
+    const command = typeof input === 'object' && input && (input.command ?? input.cmd);
+    const args = directCommandArguments(command);
+    const grant = contract.reportBinding;
+    if (!args || args.length !== 5 || args[1] !== 'message' || args[2] !== 'send'
+        || !/^crewmoor(?:\.exe)?$/i.test(path.basename(args[0])) || executablePath(args[0]) !== grant.executable
+        || checkedPath(args[3], action.cwd) !== grant.path) return false;
+    const binding = JSON.parse(fs.readFileSync(checkedPath(grant.path), 'utf8'));
+    if (JSON.stringify(binding) !== grant.snapshot) return false;
+    const { worker, dispatcher } = bindingIdentity(binding);
+    const family = action.hostFamily === 'claude-code' ? 'claude' : action.hostFamily;
+    if (worker.agent !== family || worker.session !== action.nativeSessionId || action.child) return false;
+    const message = JSON.parse(fs.readFileSync(artifactPath(args[4], contract.auditOutput, action.cwd), 'utf8'));
+    if (!record(message) || Object.keys(message).some(key => !['id', 'from', 'to', 'reply_to', 'content'].includes(key))
+        || !text(message.id) || message.from !== worker.role || message.to !== dispatcher.role
+        || message.reply_to != null && (!text(message.reply_to) || message.reply_to === message.id)
+        || !text(message.content) || Buffer.byteLength(message.content) > 16384) return false;
+    return true;
+  } catch { return false; }
+}
+
+module.exports = { auditDirectory, reportBinding, validAuditDirectory, validReportBinding, validPathSpelling,
+  narrowedDirectory, sameBinding, authorizeAuditAction };
+
+},
+"src/shell-analysis.cjs": function(module, exports, __require) {
+'use strict';
+
+const HASH_COMMAND = /\b(?:Get-FileHash|md5sum|sha(?:1|224|256|384|512)sum|shasum|b2sum)\b|\bcertutil\b[^\r\n]*\s-hashfile\b|\bopenssl\s+dgst\b/i;
+const DEPENDENCY_COMMAND = /\b(?:npm|pnpm|yarn)\s+(?:add|install)\b|\bpip(?:3)?\s+install\b|\bcargo\s+add\b|\bdotnet\s+add\b[^\r\n]*\bpackage\b|\bgo\s+get\b|\bcomposer\s+require\b|\bbundle\s+add\b/i;
+
+function classifyGitBranchArguments(args) {
+  let listing = false, positional = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') { positional ||= i + 1 < args.length; break; }
+    if (!arg.startsWith('-')) { positional = true; continue; }
+    if (/^(?:-[a-zA-Z]*[dDmMcCf][a-zA-Z]*|--(?:delete|move|copy|force|edit-description|set-upstream-to|unset-upstream|track|no-track|create-reflog)(?:=.*)?)$/.test(arg)) return 'write';
+    if (arg === '--list' || /^-[alrv]+$/.test(arg)) {
+      listing ||= arg === '--list' || arg.includes('l');
+      continue;
+    }
+    if (/^--(?:contains|no-contains|merged|no-merged)(?:=.*)?$/.test(arg)) {
+      listing = true;
+      if (!arg.includes('=') && args[i + 1] && !args[i + 1].startsWith('-')) i++;
+      continue;
+    }
+    if (/^--(?:points-at|format|sort)(?:=.*)?$/.test(arg)) {
+      listing ||= arg === '--points-at' || arg.startsWith('--points-at=');
+      if (!arg.includes('=')) {
+        if (i + 1 === args.length) return 'unknown';
+        i++;
+      }
+      continue;
+    }
+    if (/^--(?:show-current|all|remotes|verbose|no-color|column|no-column|ignore-case|omit-empty|no-abbrev)$/.test(arg)
+        || /^--(?:color=(?:always|never|auto)|abbrev(?:=\d+)?|column=.+)$/.test(arg)) continue;
+    // Negation and abbreviations can cancel --list or select a mutation.
+    return 'unknown';
+  }
+  return positional && !listing ? 'unknown' : 'read';
+}
+
+const READ_POWERSHELL_COMMANDS = new Set([
+  'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
+  'select-string', 'select-object', 'measure-object', 'compare-object', 'where-object'
+]);
+const READ_SHELL_COMMANDS = new Set([
+  ...READ_POWERSHELL_COMMANDS,
+  'rg', 'grep', 'findstr', 'cat', 'ls', 'dir', 'pwd', 'head', 'tail', 'wc', 'type'
+]);
+const WRITE_SHELL_COMMANDS = new Set([
+  'remove-item', 'move-item', 'copy-item', 'set-content', 'add-content', 'out-file',
+  'new-item', 'rm', 'del', 'erase', 'rmdir', 'mv', 'cp', 'touch', 'mkdir', 'tee', 'apply_patch'
+]);
+
+// Analyze only static words, literal quotes and simple command chains. The
+// hook does not expose a shell AST. Expansions, script blocks and ambiguous
+// escapes stay unknown instead of being interpreted as Bash or PowerShell.
+function staticShellCommands(text) {
+  const commands = [];
+  let args = [], word = '', inWord = false, quote = null, separator = null;
+  let nativeQuotes = false, hasPipe = false, hasSeparator = false;
+  const finishWord = () => {
+    if (inWord) args.push(word);
+    word = ''; inWord = false;
+  };
+  const finishCommand = () => {
+    commands.push({ args, nativeQuotes });
+    args = []; nativeQuotes = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i], next = text[i + 1];
+    // PowerShell recognizes these quotes; Bash treats them as ordinary text.
+    // They are literal only inside a quote of the opposite kind.
+    const smartQuote = /[\u2018-\u201b]/.test(char) ? "'"
+      : /[\u201c-\u201e]/.test(char) ? '"' : null;
+    if (smartQuote && (!quote || quote === smartQuote)) return null;
+    if (quote) {
+      // Legacy PowerShell native argv can split embedded double quotes back
+      // into options. Cmdlets receive the literal argument directly.
+      if (quote === "'" && char === '"' || quote === '"' && char === '"' && next === '"') nativeQuotes = true;
+      if (char === quote) { quote = null; continue; }
+      if (quote === '"' && (char === '$' || char === '`'
+          || char === '\\' && /["$`\\\r\n]/.test(next || ''))) return null;
+      word += char;
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; inWord = true; continue; }
+    if (/[ \t]/.test(char)) { finishWord(); continue; }
+    if (char === '>') return { redirected: true };
+    if (/[$`{}()<@%*?\[\]#]/.test(char)) return null;
+    // Bash removes even an escape before an ordinary letter (e.g. --out\put).
+    // Without a shell identity, do not interpret an unquoted backslash.
+    if (char === '\\') return null;
+    if (char === '\r' || char === '\n' || char === ';' || char === '|' || char === '&') {
+      hasSeparator = true;
+      finishWord();
+      // PowerShell also accepts a standalone CR as a command separator.
+      const operator = char === '\r' ? '\n'
+        : (char === '&' || char === '|') && next === char ? char + text[++i] : char;
+      if (operator === '&') return null;
+      if (operator === '|') hasPipe = true;
+      if (args.length) finishCommand();
+      else if (operator === '\n') continue;
+      else return null;
+      separator = operator;
+      continue;
+    }
+    if (/\s/.test(char)) return null;
+    word += char; inWord = true;
+  }
+  if (quote) return null;
+  finishWord();
+  if (args.length) finishCommand();
+  else if (['&&', '||', '|'].includes(separator)) return null;
+  return commands.length ? { commands, hasPipe, hasSeparator } : null;
+}
+
+function directCommandArguments(command) {
+  if (typeof command !== 'string') return null;
+  const parsed = staticShellCommands(command);
+  return parsed?.commands?.length === 1 && !parsed.hasSeparator && !parsed.commands[0].nativeQuotes
+    ? parsed.commands[0].args : null;
+}
+
+// Consume ripgrep option values before interpreting -- or executable options.
+// Otherwise a pattern named -- can hide a later --hostname-bin, or an option
+// name used as a literal pattern can be mistaken for an executable option.
+const RIPGREP_VALUE_OPTIONS = new Set([
+  '--regexp', '--file', '--pre-glob', '--dfa-size-limit', '--encoding', '--engine',
+  '--max-count', '--regex-size-limit', '--threads', '--glob', '--iglob',
+  '--ignore-file', '--max-depth', '--max-filesize', '--type', '--type-not',
+  '--type-add', '--type-clear', '--after-context', '--before-context', '--color',
+  '--colors', '--context', '--context-separator', '--field-context-separator',
+  '--field-match-separator', '--hyperlink-format', '--max-columns',
+  '--path-separator', '--replace', '--sort', '--sortr', '--generate'
+]);
+
+function classifyRipgrepArguments(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (/^--(?:pre|hostname-bin)(?:=|$)/.test(arg)) return shellClassification('unknown', 'shell_execution_option');
+    let consumesValue = RIPGREP_VALUE_OPTIONS.has(arg);
+    if (/^-[^-]/.test(arg)) {
+      // A value can be attached to a short option, including in a flag cluster.
+      const valueFlag = /[efEmjgdtTABCMr]/.exec(arg.slice(1));
+      consumesValue = Boolean(valueFlag && valueFlag.index === arg.length - 2);
+    }
+    if (consumesValue && ++i === args.length) return shellClassification('unknown', 'option_value_missing');
+  }
+  return shellClassification('read');
+}
+
+function shellClassification(mutability, analysisReason) {
+  return { mutability, ...(analysisReason ? { analysisReason } : {}) };
+}
+
+function combineClassifications(classifications) {
+  const kinds = classifications.map(result => result.mutability);
+  const mutability = kinds.includes('write') ? 'write'
+    : kinds.every(kind => kind === 'read') ? 'read' : 'unknown';
+  const decisive = classifications.find(result => result.mutability === mutability);
+  return shellClassification(mutability, decisive?.analysisReason);
+}
+
+function classifyStaticCommand({ args: [program, ...args], nativeQuotes }) {
+  const name = String(program || '').toLowerCase();
+  if (WRITE_SHELL_COMMANDS.has(name)) return shellClassification('write');
+  const cmdlet = READ_POWERSHELL_COMMANDS.has(name);
+  if (nativeQuotes && !cmdlet) return shellClassification('unknown', 'native_quotes_unproven');
+  const classifications = [classifyCommandArguments(name, [...args])];
+  // Legacy PowerShell drops empty native argv entries. A read must remain a
+  // read in both interpretations; cmdlets receive their arguments directly.
+  if (!cmdlet && args.includes('')) classifications.push(classifyCommandArguments(name, args.filter(arg => arg !== '')));
+  const result = combineClassifications(classifications);
+  if (classifications.some(entry => entry.mutability !== result.mutability)) result.analysisReason = 'native_empty_arguments';
+  return result;
+}
+
+// A one-shot dependency approval may only bind one statically parsed direct invocation.
+function directDependencyArguments(command, allowWrapper = true) {
+  if (typeof command !== 'string') return null;
+  const parsed = staticShellCommands(command.trim());
+  if (!parsed || parsed.redirected || parsed.commands.length !== 1 || parsed.commands[0].nativeQuotes) return null;
+  const [program, verb, ...args] = parsed.commands[0].args;
+  // For an unambiguous PowerShell wrapper, authorize only the extracted
+  // direct operation as a new controlled child, never execute the wrapper.
+  if (allowWrapper && /(?:^|[\\/])(?:pwsh|powershell)(?:\.exe)?$/i.test(String(program || ''))) {
+    const parts = [verb, ...args];
+    let index = 0;
+    while (index < parts.length && /^-(?:nologo|noprofile|noninteractive)$/i.test(parts[index])) index++;
+    if (!/^-command$/i.test(parts[index] || '') || parts.length !== index + 2) return null;
+    return directDependencyArguments(parts[index + 1], false);
+  }
+  const name = String(program || '').toLowerCase(), operation = String(verb || '').toLowerCase();
+  let recognized = false;
+  if (['npm', 'pnpm', 'yarn'].includes(name)) recognized = ['install', 'add'].includes(operation);
+  if (['pip', 'pip3'].includes(name)) recognized = operation === 'install';
+  if (['cargo', 'bundle'].includes(name)) recognized = operation === 'add';
+  if (name === 'composer') recognized = operation === 'require';
+  if (name === 'go') recognized = operation === 'get';
+  if (name === 'dotnet') recognized = operation === 'add' && args.some(value => value.toLowerCase() === 'package');
+  return recognized ? parsed.commands[0].args : null;
+}
+
+function isDirectDependencyCommand(command) {
+  return directDependencyArguments(command) !== null;
+}
+
+function analyzeShell(command) {
+  const text = String(command || '').replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
+  const analysis = staticShellCommands(text);
+  if (!analysis || analysis.redirected) return {
+    ...shellClassification(analysis?.redirected ? 'write' : 'unknown', analysis?.redirected ? 'shell_redirection' : 'shell_syntax_unproven'),
+    hashIntent: HASH_COMMAND.test(text), dependencyIntent: DEPENDENCY_COMMAND.test(text)
+  };
+  const commands = analysis.commands.map(command => ({
+    ...classifyStaticCommand(command), text: command.args.join(' '),
+    // Static PowerShell content cmdlets receive their literal arguments as data.
+    // Dynamic syntax is rejected by staticShellCommands before this point.
+    literalContent: analysis.commands.length === 1 && !analysis.hasPipe && ['set-content', 'add-content'].includes(String(command.args[0] || '').toLowerCase())
+  }));
+  // Proven reads treat their arguments as data. Keep the existing intent checks
+  // for writes and unproven programs, independently for each command in a chain.
+  return {
+    ...combineClassifications(commands),
+    hashIntent: commands.some(command => command.mutability !== 'read' && !command.literalContent && HASH_COMMAND.test(command.text)),
+    dependencyIntent: commands.some(command => command.mutability !== 'read' && !command.literalContent && DEPENDENCY_COMMAND.test(command.text))
+  };
+}
+
+// Required values consume the following argument, even when it is --. Optional
+// values must be attached with =. Unknown options cannot establish a read.
+const GIT_QUERY_VALUE_OPTIONS = new Set([
+  '--word-diff-regex', '--src-prefix', '--dst-prefix', '--line-prefix',
+  '--output-indicator-new', '--output-indicator-old', '--output-indicator-context',
+  '--diff-algorithm', '--anchored', '--ignore-matching-lines', '--diff-filter',
+  '--stat-width', '--stat-name-width', '--stat-graph-width', '--stat-count',
+  '--inter-hunk-context', '--rotate-to', '--skip-to', '--find-object'
+]);
+const GIT_QUERY_FLAGS = new Set([
+  '--short', '--branch', '--show-stash', '--no-index', '--numstat', '--shortstat',
+  '--name-only', '--name-status', '--check', '--summary', '--patch', '--no-patch',
+  '--raw', '--binary', '--cached', '--staged', '--exit-code', '--quiet',
+  '--no-color', '--no-ext-diff', '--no-textconv', '--ignore-all-space',
+  '--ignore-space-change', '--ignore-space-at-eol', '--ignore-cr-at-eol',
+  '--ignore-blank-lines', '--patience', '--histogram', '--minimal',
+  '--oneline', '--all', '--reverse', '--first-parent', '--no-merges', '--merges',
+  '--graph', '--no-decorate', '--topo-order', '--date-order', '--no-renames',
+  '--pickaxe-all', '--pickaxe-regex', '--no-prefix', '--default-prefix',
+  '--show-toplevel', '--show-prefix', '--show-cdup', '--git-dir', '--git-common-dir',
+  '--is-inside-work-tree', '--is-bare-repository', '--verify', '--symbolic-full-name'
+]);
+const GIT_QUERY_OPTIONAL_VALUES = new Set([
+  '--stat', '--color', '--word-diff', '--color-words', '--relative', '--unified',
+  '--abbrev', '--short', '--abbrev-ref', '--porcelain', '--untracked-files', '--ignored',
+  '--find-renames', '--find-copies', '--break-rewrites', '--decorate', '--pretty'
+]);
+const GIT_QUERY_ATTACHED_ONLY = new Set([
+  '--format', '--date', '--since', '--until', '--before', '--after', '--author',
+  '--committer', '--grep', '--max-count', '--skip', '--diff-merges', '--encoding'
+]);
+
+function classifyGitQueryArguments(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (!arg.startsWith('-')) continue;
+    if (/^--output(?:=|$)/.test(arg)) return shellClassification('write', 'git_output_file');
+    const name = arg.split('=', 1)[0];
+    if (GIT_QUERY_VALUE_OPTIONS.has(name)) {
+      if (arg === name && ++i === args.length) return shellClassification('unknown', 'option_value_missing');
+      continue;
+    }
+    if (GIT_QUERY_FLAGS.has(arg) || GIT_QUERY_OPTIONAL_VALUES.has(name)
+        || arg.includes('=') && GIT_QUERY_ATTACHED_ONLY.has(name)) continue;
+    if (/^-[SGOIn]$/.test(arg)) {
+      if (++i === args.length) return shellClassification('unknown', 'option_value_missing');
+      continue;
+    }
+    if (/^-[SGOI].+/.test(arg) || /^-n\d+$/.test(arg) || /^-\d+$/.test(arg)
+        || /^-[pwsbz]+$/.test(arg) || /^-[UMCB](?:\d+%?)?$/.test(arg)
+        || /^-u(?:no|normal|all)?$/.test(arg)) continue;
+    return shellClassification('unknown', 'git_arguments_unproven');
+  }
+  return shellClassification('read');
+}
+
+function classifyCommandArguments(name, args) {
+  if (name === 'git') {
+    // Only these global options preserve the supported command interpretation.
+    while (args.length) {
+      if (args[0] === '--no-pager' || args[0] === '--literal-pathspecs') args.shift();
+      else if (args[0] === '-C' && args.length > 1) args.splice(0, 2);
+      else break;
+    }
+    const subcommand = args.shift();
+    if (['add', 'commit', 'push', 'merge', 'rebase', 'checkout', 'switch', 'reset', 'restore', 'clean', 'tag'].includes(subcommand)) return shellClassification('write');
+    if (subcommand === 'branch') {
+      const mutability = classifyGitBranchArguments(args);
+      return shellClassification(mutability, mutability === 'unknown' ? 'git_arguments_unproven' : undefined);
+    }
+    if (['status', 'diff', 'log', 'show', 'rev-parse'].includes(subcommand)) return classifyGitQueryArguments(args);
+    return shellClassification('unknown', 'git_arguments_unproven');
+  }
+  if (['npm', 'pnpm', 'yarn'].includes(name) && ['add', 'install', 'remove', 'uninstall', 'publish'].includes(args[0])) return shellClassification('write');
+  if (['pip', 'pip3'].includes(name) && args[0] === 'install') return shellClassification('write');
+  if (name === 'gh' && /^(?:pr (?:create|merge|close)|issue (?:create|close)|release create)$/.test(args.slice(0, 2).join(' '))) return shellClassification('write');
+  if (name === 'rg') return classifyRipgrepArguments(args);
+  if (READ_SHELL_COMMANDS.has(name)) return shellClassification('read');
+  if (['node', 'python', 'python3', 'py'].includes(name) && args.length === 1 && args[0] === '--version') return shellClassification('read');
+  return shellClassification('unknown', 'shell_command_unproven');
+}
+
+function classifyShell(command) {
+  return analyzeShell(command).mutability;
+}
+
+// Some installed hook payloads lack command but carry intent text in a legacy
+// field. Keep their mutability unproven while retaining hash/dependency facts.
+function analyzeShellInput(toolInput) {
+  const command = toolInput && toolInput.command;
+  const text = typeof toolInput === 'string' ? toolInput
+    : toolInput && typeof toolInput === 'object'
+      ? String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '') : '';
+  const analysis = analyzeShell(command);
+  if (text !== String(command || '')) {
+    const intents = analyzeShell(text);
+    analysis.hashIntent = intents.hashIntent;
+    analysis.dependencyIntent = intents.dependencyIntent;
+  }
+  return analysis;
+}
+
+module.exports = { analyzeShell, analyzeShellInput, classifyShell, isDirectDependencyCommand, directDependencyArguments, directCommandArguments };
+
+},
+"src/tool-input.cjs": function(module, exports, __require) {
+'use strict';
+
+// Keep the native Codex text wrappers identical for path classification and
+// review authorization. Unknown shapes yield no provable patch targets.
+function inputText(toolInput) {
+  if (typeof toolInput === 'string') return toolInput;
+  if (!toolInput || typeof toolInput !== 'object') return '';
+  return String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '');
+}
+
+module.exports = { inputText };
 
 },
 "src/delegation-state.cjs": function(module, exports, __require) {
@@ -1685,6 +2297,7 @@ const nodePath = require('node:path');
 const { DEFAULT_AGENT_LIMIT } = __require("src/contracts.cjs");
 const { inspectDelegation } = __require("src/delegation-state.cjs");
 const { SHELL_ANALYSIS_REASONS, isShellAnalysisReason } = __require("src/control-protocol.cjs");
+const { authorizeAuditAction } = __require("src/review-audit.cjs");
 
 function analysisExplanation(action) {
   return isShellAnalysisReason(action.analysisReason)
@@ -1774,7 +2387,8 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
   }
 
   const nonMutatingMode = ['answer', 'review', 'monitor'].includes(mode);
-  if (nonMutatingMode && action.mutability === 'write') {
+  const auditAllowed = authorizeAuditAction(contract, action);
+  if (nonMutatingMode && action.mutability === 'write' && !auditAllowed) {
     return decision(
       controlledOutcome(level),
       'I',
@@ -1784,7 +2398,7 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
     );
   }
 
-  if (nonMutatingMode && action.mutability === 'unknown') {
+  if (nonMutatingMode && action.mutability === 'unknown' && !auditAllowed) {
     return decision(
       controlledOutcome(level, 'require_user_approval'),
       'I',
@@ -2607,6 +3221,7 @@ const {
 } = __require("src/contracts.cjs");
 
 const CURRENT_SCHEMA_VERSION = 4;
+const audit = __require("src/review-audit.cjs");
 
 function freshState() {
   return {
@@ -2736,6 +3351,10 @@ function normalizeState(parsed) {
 }
 
 function validStoredContract(contract, schemaVersion) {
+  // Older schema-4 contracts predate audit grants: absence means no authority.
+  if (Object.hasOwn(contract, 'auditOutput') && !audit.validAuditDirectory(contract.auditOutput)
+      || Object.hasOwn(contract, 'reportBinding') && (!audit.validReportBinding(contract.reportBinding)
+        || contract.reportBinding !== null && !contract.auditOutput)) return false;
   const checks = {
     mode: value => value === 'unconfirmed' || MODES.has(value),
     level: value => LEVELS.has(value),
@@ -3066,332 +3685,6 @@ function acceptNativeAnswer(record, action, now = Date.now()) {
 }
 
 module.exports = { YES, NO, SYNC_HEADER, digest, newPending, live, proposalStillAllowed, isProposalQuestion, isSyncQuestion, syncQuestionDigest, registerQuestion, acceptReply, nativeQuestionMatches, nativeAnswerMatches, acceptNativeAnswer, hostQuestionText };
-
-},
-"src/shell-analysis.cjs": function(module, exports, __require) {
-'use strict';
-
-const HASH_COMMAND = /\b(?:Get-FileHash|md5sum|sha(?:1|224|256|384|512)sum|shasum|b2sum)\b|\bcertutil\b[^\r\n]*\s-hashfile\b|\bopenssl\s+dgst\b/i;
-const DEPENDENCY_COMMAND = /\b(?:npm|pnpm|yarn)\s+(?:add|install)\b|\bpip(?:3)?\s+install\b|\bcargo\s+add\b|\bdotnet\s+add\b[^\r\n]*\bpackage\b|\bgo\s+get\b|\bcomposer\s+require\b|\bbundle\s+add\b/i;
-
-function classifyGitBranchArguments(args) {
-  let listing = false, positional = false;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--') { positional ||= i + 1 < args.length; break; }
-    if (!arg.startsWith('-')) { positional = true; continue; }
-    if (/^(?:-[a-zA-Z]*[dDmMcCf][a-zA-Z]*|--(?:delete|move|copy|force|edit-description|set-upstream-to|unset-upstream|track|no-track|create-reflog)(?:=.*)?)$/.test(arg)) return 'write';
-    if (arg === '--list' || /^-[alrv]+$/.test(arg)) {
-      listing ||= arg === '--list' || arg.includes('l');
-      continue;
-    }
-    if (/^--(?:contains|no-contains|merged|no-merged)(?:=.*)?$/.test(arg)) {
-      listing = true;
-      if (!arg.includes('=') && args[i + 1] && !args[i + 1].startsWith('-')) i++;
-      continue;
-    }
-    if (/^--(?:points-at|format|sort)(?:=.*)?$/.test(arg)) {
-      listing ||= arg === '--points-at' || arg.startsWith('--points-at=');
-      if (!arg.includes('=')) {
-        if (i + 1 === args.length) return 'unknown';
-        i++;
-      }
-      continue;
-    }
-    if (/^--(?:show-current|all|remotes|verbose|no-color|column|no-column|ignore-case|omit-empty|no-abbrev)$/.test(arg)
-        || /^--(?:color=(?:always|never|auto)|abbrev(?:=\d+)?|column=.+)$/.test(arg)) continue;
-    // Negation and abbreviations can cancel --list or select a mutation.
-    return 'unknown';
-  }
-  return positional && !listing ? 'unknown' : 'read';
-}
-
-const READ_POWERSHELL_COMMANDS = new Set([
-  'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
-  'select-string', 'select-object', 'measure-object', 'compare-object', 'where-object'
-]);
-const READ_SHELL_COMMANDS = new Set([
-  ...READ_POWERSHELL_COMMANDS,
-  'rg', 'grep', 'findstr', 'cat', 'ls', 'dir', 'pwd', 'head', 'tail', 'wc', 'type'
-]);
-const WRITE_SHELL_COMMANDS = new Set([
-  'remove-item', 'move-item', 'copy-item', 'set-content', 'add-content', 'out-file',
-  'new-item', 'rm', 'del', 'erase', 'rmdir', 'mv', 'cp', 'touch', 'mkdir', 'tee', 'apply_patch'
-]);
-
-// Analyze only static words, literal quotes and simple command chains. The
-// hook does not expose a shell AST. Expansions, script blocks and ambiguous
-// escapes stay unknown instead of being interpreted as Bash or PowerShell.
-function staticShellCommands(text) {
-  const commands = [];
-  let args = [], word = '', inWord = false, quote = null, separator = null;
-  let nativeQuotes = false, hasPipe = false;
-  const finishWord = () => {
-    if (inWord) args.push(word);
-    word = ''; inWord = false;
-  };
-  const finishCommand = () => {
-    commands.push({ args, nativeQuotes });
-    args = []; nativeQuotes = false;
-  };
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i], next = text[i + 1];
-    // PowerShell recognizes these quotes; Bash treats them as ordinary text.
-    // They are literal only inside a quote of the opposite kind.
-    const smartQuote = /[\u2018-\u201b]/.test(char) ? "'"
-      : /[\u201c-\u201e]/.test(char) ? '"' : null;
-    if (smartQuote && (!quote || quote === smartQuote)) return null;
-    if (quote) {
-      // Legacy PowerShell native argv can split embedded double quotes back
-      // into options. Cmdlets receive the literal argument directly.
-      if (quote === "'" && char === '"' || quote === '"' && char === '"' && next === '"') nativeQuotes = true;
-      if (char === quote) { quote = null; continue; }
-      if (quote === '"' && (char === '$' || char === '`'
-          || char === '\\' && /["$`\\\r\n]/.test(next || ''))) return null;
-      word += char;
-      continue;
-    }
-    if (char === "'" || char === '"') { quote = char; inWord = true; continue; }
-    if (/[ \t]/.test(char)) { finishWord(); continue; }
-    if (char === '>') return { redirected: true };
-    if (/[$`{}()<@%*?\[\]#]/.test(char)) return null;
-    // Bash removes even an escape before an ordinary letter (e.g. --out\put).
-    // Without a shell identity, do not interpret an unquoted backslash.
-    if (char === '\\') return null;
-    if (char === '\r' || char === '\n' || char === ';' || char === '|' || char === '&') {
-      finishWord();
-      // PowerShell also accepts a standalone CR as a command separator.
-      const operator = char === '\r' ? '\n'
-        : (char === '&' || char === '|') && next === char ? char + text[++i] : char;
-      if (operator === '&') return null;
-      if (operator === '|') hasPipe = true;
-      if (args.length) finishCommand();
-      else if (operator === '\n') continue;
-      else return null;
-      separator = operator;
-      continue;
-    }
-    if (/\s/.test(char)) return null;
-    word += char; inWord = true;
-  }
-  if (quote) return null;
-  finishWord();
-  if (args.length) finishCommand();
-  else if (['&&', '||', '|'].includes(separator)) return null;
-  return commands.length ? { commands, hasPipe } : null;
-}
-
-// Consume ripgrep option values before interpreting -- or executable options.
-// Otherwise a pattern named -- can hide a later --hostname-bin, or an option
-// name used as a literal pattern can be mistaken for an executable option.
-const RIPGREP_VALUE_OPTIONS = new Set([
-  '--regexp', '--file', '--pre-glob', '--dfa-size-limit', '--encoding', '--engine',
-  '--max-count', '--regex-size-limit', '--threads', '--glob', '--iglob',
-  '--ignore-file', '--max-depth', '--max-filesize', '--type', '--type-not',
-  '--type-add', '--type-clear', '--after-context', '--before-context', '--color',
-  '--colors', '--context', '--context-separator', '--field-context-separator',
-  '--field-match-separator', '--hyperlink-format', '--max-columns',
-  '--path-separator', '--replace', '--sort', '--sortr', '--generate'
-]);
-
-function classifyRipgrepArguments(args) {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--') break;
-    if (/^--(?:pre|hostname-bin)(?:=|$)/.test(arg)) return shellClassification('unknown', 'shell_execution_option');
-    let consumesValue = RIPGREP_VALUE_OPTIONS.has(arg);
-    if (/^-[^-]/.test(arg)) {
-      // A value can be attached to a short option, including in a flag cluster.
-      const valueFlag = /[efEmjgdtTABCMr]/.exec(arg.slice(1));
-      consumesValue = Boolean(valueFlag && valueFlag.index === arg.length - 2);
-    }
-    if (consumesValue && ++i === args.length) return shellClassification('unknown', 'option_value_missing');
-  }
-  return shellClassification('read');
-}
-
-function shellClassification(mutability, analysisReason) {
-  return { mutability, ...(analysisReason ? { analysisReason } : {}) };
-}
-
-function combineClassifications(classifications) {
-  const kinds = classifications.map(result => result.mutability);
-  const mutability = kinds.includes('write') ? 'write'
-    : kinds.every(kind => kind === 'read') ? 'read' : 'unknown';
-  const decisive = classifications.find(result => result.mutability === mutability);
-  return shellClassification(mutability, decisive?.analysisReason);
-}
-
-function classifyStaticCommand({ args: [program, ...args], nativeQuotes }) {
-  const name = String(program || '').toLowerCase();
-  if (WRITE_SHELL_COMMANDS.has(name)) return shellClassification('write');
-  const cmdlet = READ_POWERSHELL_COMMANDS.has(name);
-  if (nativeQuotes && !cmdlet) return shellClassification('unknown', 'native_quotes_unproven');
-  const classifications = [classifyCommandArguments(name, [...args])];
-  // Legacy PowerShell drops empty native argv entries. A read must remain a
-  // read in both interpretations; cmdlets receive their arguments directly.
-  if (!cmdlet && args.includes('')) classifications.push(classifyCommandArguments(name, args.filter(arg => arg !== '')));
-  const result = combineClassifications(classifications);
-  if (classifications.some(entry => entry.mutability !== result.mutability)) result.analysisReason = 'native_empty_arguments';
-  return result;
-}
-
-// A one-shot dependency approval may only bind one statically parsed direct invocation.
-function directDependencyArguments(command, allowWrapper = true) {
-  if (typeof command !== 'string') return null;
-  const parsed = staticShellCommands(command.trim());
-  if (!parsed || parsed.redirected || parsed.commands.length !== 1 || parsed.commands[0].nativeQuotes) return null;
-  const [program, verb, ...args] = parsed.commands[0].args;
-  // For an unambiguous PowerShell wrapper, authorize only the extracted
-  // direct operation as a new controlled child, never execute the wrapper.
-  if (allowWrapper && /(?:^|[\\/])(?:pwsh|powershell)(?:\.exe)?$/i.test(String(program || ''))) {
-    const parts = [verb, ...args];
-    let index = 0;
-    while (index < parts.length && /^-(?:nologo|noprofile|noninteractive)$/i.test(parts[index])) index++;
-    if (!/^-command$/i.test(parts[index] || '') || parts.length !== index + 2) return null;
-    return directDependencyArguments(parts[index + 1], false);
-  }
-  const name = String(program || '').toLowerCase(), operation = String(verb || '').toLowerCase();
-  let recognized = false;
-  if (['npm', 'pnpm', 'yarn'].includes(name)) recognized = ['install', 'add'].includes(operation);
-  if (['pip', 'pip3'].includes(name)) recognized = operation === 'install';
-  if (['cargo', 'bundle'].includes(name)) recognized = operation === 'add';
-  if (name === 'composer') recognized = operation === 'require';
-  if (name === 'go') recognized = operation === 'get';
-  if (name === 'dotnet') recognized = operation === 'add' && args.some(value => value.toLowerCase() === 'package');
-  return recognized ? parsed.commands[0].args : null;
-}
-
-function isDirectDependencyCommand(command) {
-  return directDependencyArguments(command) !== null;
-}
-
-function analyzeShell(command) {
-  const text = String(command || '').replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
-  const analysis = staticShellCommands(text);
-  if (!analysis || analysis.redirected) return {
-    ...shellClassification(analysis?.redirected ? 'write' : 'unknown', analysis?.redirected ? 'shell_redirection' : 'shell_syntax_unproven'),
-    hashIntent: HASH_COMMAND.test(text), dependencyIntent: DEPENDENCY_COMMAND.test(text)
-  };
-  const commands = analysis.commands.map(command => ({
-    ...classifyStaticCommand(command), text: command.args.join(' '),
-    // Static PowerShell content cmdlets receive their literal arguments as data.
-    // Dynamic syntax is rejected by staticShellCommands before this point.
-    literalContent: analysis.commands.length === 1 && !analysis.hasPipe && ['set-content', 'add-content'].includes(String(command.args[0] || '').toLowerCase())
-  }));
-  // Proven reads treat their arguments as data. Keep the existing intent checks
-  // for writes and unproven programs, independently for each command in a chain.
-  return {
-    ...combineClassifications(commands),
-    hashIntent: commands.some(command => command.mutability !== 'read' && !command.literalContent && HASH_COMMAND.test(command.text)),
-    dependencyIntent: commands.some(command => command.mutability !== 'read' && !command.literalContent && DEPENDENCY_COMMAND.test(command.text))
-  };
-}
-
-// Required values consume the following argument, even when it is --. Optional
-// values must be attached with =. Unknown options cannot establish a read.
-const GIT_QUERY_VALUE_OPTIONS = new Set([
-  '--word-diff-regex', '--src-prefix', '--dst-prefix', '--line-prefix',
-  '--output-indicator-new', '--output-indicator-old', '--output-indicator-context',
-  '--diff-algorithm', '--anchored', '--ignore-matching-lines', '--diff-filter',
-  '--stat-width', '--stat-name-width', '--stat-graph-width', '--stat-count',
-  '--inter-hunk-context', '--rotate-to', '--skip-to', '--find-object'
-]);
-const GIT_QUERY_FLAGS = new Set([
-  '--short', '--branch', '--show-stash', '--no-index', '--numstat', '--shortstat',
-  '--name-only', '--name-status', '--check', '--summary', '--patch', '--no-patch',
-  '--raw', '--binary', '--cached', '--staged', '--exit-code', '--quiet',
-  '--no-color', '--no-ext-diff', '--no-textconv', '--ignore-all-space',
-  '--ignore-space-change', '--ignore-space-at-eol', '--ignore-cr-at-eol',
-  '--ignore-blank-lines', '--patience', '--histogram', '--minimal',
-  '--oneline', '--all', '--reverse', '--first-parent', '--no-merges', '--merges',
-  '--graph', '--no-decorate', '--topo-order', '--date-order', '--no-renames',
-  '--pickaxe-all', '--pickaxe-regex', '--no-prefix', '--default-prefix',
-  '--show-toplevel', '--show-prefix', '--show-cdup', '--git-dir', '--git-common-dir',
-  '--is-inside-work-tree', '--is-bare-repository', '--verify', '--symbolic-full-name'
-]);
-const GIT_QUERY_OPTIONAL_VALUES = new Set([
-  '--stat', '--color', '--word-diff', '--color-words', '--relative', '--unified',
-  '--abbrev', '--short', '--abbrev-ref', '--porcelain', '--untracked-files', '--ignored',
-  '--find-renames', '--find-copies', '--break-rewrites', '--decorate', '--pretty'
-]);
-const GIT_QUERY_ATTACHED_ONLY = new Set([
-  '--format', '--date', '--since', '--until', '--before', '--after', '--author',
-  '--committer', '--grep', '--max-count', '--skip', '--diff-merges', '--encoding'
-]);
-
-function classifyGitQueryArguments(args) {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--') break;
-    if (!arg.startsWith('-')) continue;
-    if (/^--output(?:=|$)/.test(arg)) return shellClassification('write', 'git_output_file');
-    const name = arg.split('=', 1)[0];
-    if (GIT_QUERY_VALUE_OPTIONS.has(name)) {
-      if (arg === name && ++i === args.length) return shellClassification('unknown', 'option_value_missing');
-      continue;
-    }
-    if (GIT_QUERY_FLAGS.has(arg) || GIT_QUERY_OPTIONAL_VALUES.has(name)
-        || arg.includes('=') && GIT_QUERY_ATTACHED_ONLY.has(name)) continue;
-    if (/^-[SGOIn]$/.test(arg)) {
-      if (++i === args.length) return shellClassification('unknown', 'option_value_missing');
-      continue;
-    }
-    if (/^-[SGOI].+/.test(arg) || /^-n\d+$/.test(arg) || /^-\d+$/.test(arg)
-        || /^-[pwsbz]+$/.test(arg) || /^-[UMCB](?:\d+%?)?$/.test(arg)
-        || /^-u(?:no|normal|all)?$/.test(arg)) continue;
-    return shellClassification('unknown', 'git_arguments_unproven');
-  }
-  return shellClassification('read');
-}
-
-function classifyCommandArguments(name, args) {
-  if (name === 'git') {
-    // Only these global options preserve the supported command interpretation.
-    while (args.length) {
-      if (args[0] === '--no-pager' || args[0] === '--literal-pathspecs') args.shift();
-      else if (args[0] === '-C' && args.length > 1) args.splice(0, 2);
-      else break;
-    }
-    const subcommand = args.shift();
-    if (['add', 'commit', 'push', 'merge', 'rebase', 'checkout', 'switch', 'reset', 'restore', 'clean', 'tag'].includes(subcommand)) return shellClassification('write');
-    if (subcommand === 'branch') {
-      const mutability = classifyGitBranchArguments(args);
-      return shellClassification(mutability, mutability === 'unknown' ? 'git_arguments_unproven' : undefined);
-    }
-    if (['status', 'diff', 'log', 'show', 'rev-parse'].includes(subcommand)) return classifyGitQueryArguments(args);
-    return shellClassification('unknown', 'git_arguments_unproven');
-  }
-  if (['npm', 'pnpm', 'yarn'].includes(name) && ['add', 'install', 'remove', 'uninstall', 'publish'].includes(args[0])) return shellClassification('write');
-  if (['pip', 'pip3'].includes(name) && args[0] === 'install') return shellClassification('write');
-  if (name === 'gh' && /^(?:pr (?:create|merge|close)|issue (?:create|close)|release create)$/.test(args.slice(0, 2).join(' '))) return shellClassification('write');
-  if (name === 'rg') return classifyRipgrepArguments(args);
-  if (READ_SHELL_COMMANDS.has(name)) return shellClassification('read');
-  if (['node', 'python', 'python3', 'py'].includes(name) && args.length === 1 && args[0] === '--version') return shellClassification('read');
-  return shellClassification('unknown', 'shell_command_unproven');
-}
-
-function classifyShell(command) {
-  return analyzeShell(command).mutability;
-}
-
-// Some installed hook payloads lack command but carry intent text in a legacy
-// field. Keep their mutability unproven while retaining hash/dependency facts.
-function analyzeShellInput(toolInput) {
-  const command = toolInput && toolInput.command;
-  const text = typeof toolInput === 'string' ? toolInput
-    : toolInput && typeof toolInput === 'object'
-      ? String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '') : '';
-  const analysis = analyzeShell(command);
-  if (text !== String(command || '')) {
-    const intents = analyzeShell(text);
-    analysis.hashIntent = intents.hashIntent;
-    analysis.dependencyIntent = intents.dependencyIntent;
-  }
-  return analysis;
-}
-
-module.exports = { analyzeShell, analyzeShellInput, classifyShell, isDirectDependencyCommand, directDependencyArguments };
 
 },
 "src/dependency-manager.cjs": function(module, exports, __require) {
@@ -4367,6 +4660,7 @@ const nodePath = require('node:path');
 const { analyzeShell, analyzeShellInput, classifyShell } = __require("src/shell-analysis.cjs");
 const { patchDependencyIntent } = __require("src/manifest-dependencies.cjs");
 const { detectHashIntent } = __require("src/hash-intent.cjs");
+const { inputText } = __require("src/tool-input.cjs");
 
 const WRITE_NAME = /(?:^|__|_)(?:add|append|apply|archive|close|commit|copy|create|delete|deploy|edit|install|merge|move|patch|post|publish|push|remove|rename|send|set|submit|update|upload|write)(?:$|__|_)/i;
 const READ_NAME = /(?:^|__|_)(?:cat|check|diff|fetch|find|get|inspect|list|load|open|read|review|search|show|status|view)(?:$|__|_)/i;
@@ -4379,12 +4673,6 @@ const CODEX_TOOL_NAMES = new Map([
   ...['spawn_agent', 'followup_task', 'send_message', 'list_agents', 'wait_agent', 'interrupt_agent']
     .map(name => [`collaboration${name}`, name])
 ]);
-
-function inputText(toolInput) {
-  if (typeof toolInput === 'string') return toolInput;
-  if (!toolInput || typeof toolInput !== 'object') return '';
-  return String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '');
-}
 
 function normalizePath(value, cwd) {
   let normalized = String(value || '').trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');

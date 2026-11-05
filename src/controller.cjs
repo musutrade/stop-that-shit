@@ -76,7 +76,7 @@ function handlePromptStorageFailure(event, options, error) {
     return context(`SESSION_STATE_UNAVAILABLE (${storageErrorCode(readError)}): this prompt result could not be confirmed. Check $stop-that-shit status before relying on a contract change.`);
   }
   if (state.storageError) return context(`${state.storageError.code}: ${state.storageError.message}`);
-  const parsed = parseContractPrompt(event.prompt, state.contract);
+  const parsed = parseContractPrompt(event.prompt, state.contract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
   if (parsed.error) return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
   if (parsed.changed) return contractUpdateFailure(error);
   if (parsed.directive || parsed.correction) {
@@ -112,7 +112,7 @@ function coordinatedUpdate(event, options, update) {
 
 function contractFields(contract, summary) {
   const limit = Number.isSafeInteger(contract.agentBudget) && contract.agentBudget >= 0 ? contract.agentBudget : DEFAULT_AGENT_LIMIT;
-  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}.`;
+  return `mode=${contract.mode}; agents=${summary.reservedUpperBound}/${limit} reserved${summary.unresolvedReasons.length ? '; count unproven' : ''}; hash=${contract.hashPolicy || 'deny'}; deps=${contract.dependencyPolicy || 'ask'}; files=${Array.isArray(contract.allowedPaths) ? contract.allowedPaths.join('|') : 'unbounded'}${contract.auditOutput ? '; audit-dir=' + contract.auditOutput.directory : ''}${contract.reportBinding ? '; report-binding=' + contract.reportBinding.path : ''}.`;
 }
 
 function contractContext(contract, delegation = {}, phase = 'active', directiveWarning = null, storageError = null) {
@@ -252,12 +252,20 @@ function widensFileBoundary(previous, next) {
 function handlePrompt(event, state) {
   if (state.storageError) return context(`${state.storageError.code}: ${state.storageError.message}`);
   const previousContract = state.scope?.child ? state.childContract : state.contract;
-  const parsed = parseContractPrompt(event.prompt, previousContract);
+  const parsed = parseContractPrompt(event.prompt, previousContract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
   if (parsed.error) {
     state.directiveError = parsed.error;
     state.directiveWarning = null;
     state.lastPromptContext = null;
     return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
+  }
+  if (state.scope?.child && (parsed.contract.auditOutput
+      && !require('./review-audit.cjs').narrowedDirectory(state.contract.auditOutput, parsed.contract.auditOutput)
+      || parsed.contract.reportBinding && !require('./review-audit.cjs').sameBinding(state.contract.reportBinding, parsed.contract.reportBinding))) {
+    state.directiveError = { code: 'AUDIT_BOUNDARY_WIDEN', message: 'A subagent cannot add, widen or redirect inherited audit authority.' };
+    state.directiveWarning = null;
+    state.lastPromptContext = null;
+    return { kind: 'prompt-error', error: state.directiveError, message: state.directiveError.message };
   }
   if (state.scope?.child && widensFileBoundary(state.contract.allowedPaths, parsed.contract.allowedPaths)
       && parsed.contract.allowedPaths !== previousContract.allowedPaths) {
@@ -332,7 +340,7 @@ function handleScopedPrompt(event, options) {
     // lacks the host's real child-state API. Contract changes fail closed;
     // ordinary child conversation remains read-only.
     const parent = readState(event.sessionId, options.dataDir);
-    const parsed = parseContractPrompt(event.prompt, parent.contract);
+    const parsed = parseContractPrompt(event.prompt, parent.contract, { cwd: event.cwd, sessionId: event.sourceSessionId || event.sessionId, hostFamily: event.host?.family });
     if (parsed.error) return { kind: 'prompt-error', error: parsed.error, message: parsed.error.message };
     if (parsed.directive || parsed.correction || /<send_user_message_question_reply>/.test(event.prompt)) {
       return { kind: 'prompt-error', error: { code: 'CHILD_SCOPE_UNAVAILABLE' },
@@ -524,6 +532,11 @@ function handleBeforeAction(event, options) {
     const actionChangesDelegation = event.action.mutability === 'delegate'
       || delegationLifecycleUnproven || legacyDelegationProtocol;
     const action = {
+      name: event.action.name,
+      input: event.action.input,
+      hostFamily: event.host?.family,
+      nativeSessionId: event.sourceSessionId || event.sessionId,
+      child: Boolean(state.scope?.child),
       mutability: event.action.mutability,
       analysisReason: event.action.analysisReason,
       legacyDelegationProtocol,

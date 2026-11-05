@@ -140,6 +140,96 @@ error context and pause tool calls until a corrected instruction clears the
 error. A valid watch/off directive also clears that pause. This input rejection
 does not change the previous contract or the shared watch/off policy.
 
+## Restricted audit output in review
+
+Review still denies file and service writes by default. For one audit task, an
+explicit root user directive can authorize an existing, dedicated output
+directory outside the workspace and its Git worktree, plus one existing
+CrewMoor binding. The directories must be disjoint: an ancestor of the worktree
+is also rejected. Create the output directory before submitting the directive.
+Use absolute paths; quote field values containing spaces.
+
+Codex and OpenCode:
+
+```text
+$stop-that-shit review audit-dir="/absolute/evidence/audit" report-binding="/absolute/team/audit-binding.json" -- Audit the current diff; save findings and report to the dispatcher.
+```
+
+Claude Code uses the same fields with
+`/stop-that-shit:stop-that-shit review ...`. A host startup positional prompt or
+an admitted direct root user prompt can supply the directive. SessionStart
+context, ordinary task prose, quoted examples, tool output, and a directive
+inside a CrewMoor JSON envelope's `message.content` cannot authorize it. Load
+the Guard through the host's supported plugin/hook configuration; merely
+displaying this text does not prove that the Hook ran. Check the active
+contract before claiming enforcement.
+
+Use native file editing tools to create or edit report files in that directory:
+Codex `apply_patch`/`Write`/`Edit`, Claude `Write`/`Edit`, and OpenCode
+`write`/`edit`/`patch`/`apply_patch`. For patches, only additions and updates are
+supported; deletion and relocation remain denied. Existing parent directories
+are required. Relative file paths are resolved from the host action's cwd;
+paths containing a `..` component, symlinks, hard-linked files, mixed writes,
+unknown tools/paths, shell redirection, directory creation and code/configuration
+writes in the worktree remain denied. Filenames and claims that a tool is
+writing a report grant no authority.
+
+On Windows, components with trailing dots or spaces are rejected before
+filesystem lookup, including `.. ` aliases; lexical containment must not
+authorize a path that Win32 normalizes to a different destination.
+
+Write the flat CrewMoor message JSON in the same audit directory, for example:
+
+```json
+{"id":"audit-result-001","from":"audit","to":"dispatcher","reply_to":null,"content":"Audit complete; report saved in the authorized output directory."}
+```
+
+Then use the direct native shell tool to invoke the fixed operation:
+
+```sh
+/absolute/path/to/crewmoor message send /absolute/team/audit-binding.json /absolute/evidence/audit/message.json
+```
+
+`report-binding` requires `audit-dir`. At grant time the Guard pins the binding's
+public snapshot and the CrewMoor executable resolved through its PATH. The
+binding must identify this native host/session/cwd, distinct worker and
+dispatcher roles/instances/sessions, and the same team/task. On every send it
+checks the unchanged binding, actual native worker session, exact operation,
+executable, and message `from`/`to`. Missing or changed identities, a different
+binding/target, child-session reporting, custom shell/env wrappers, pipelines,
+command chains, extra arguments and unknown message tools are denied. CrewMoor
+still performs its own live endpoint/session/instance checks; the Guard does
+not replace them. A transport `accepted` receipt is not proof of actual receipt
+or completion by the dispatcher. Establish the native identity and fixed binding
+before supplying the explicit grant; do not rebind a different session to make
+an old grant work.
+
+The grant survives ordinary prompts and a valid saved-state resume of the same
+task while review remains active. A normal CrewMoor business envelope preserves
+review and its grants; its contents cannot trigger editable-host promotion.
+OpenCode's existing direct editable-root user prompt
+promotion to change also clears the grant. Every new explicit mode directive (including another `review`), `watch`,
+`off`, or natural mode correction clears it. To revoke it immediately:
+
+```text
+$stop-that-shit review -- Continue read-only; revoke the audit exceptions.
+```
+
+Within review, `audit-dir=none report-binding=none` also revokes both, and
+`report-binding=none` revokes reporting alone. Children may only narrow an
+inherited directory and cannot add or redirect a binding. Existing `files=`,
+hash, dependency and delegation limits still apply. Old state without the new
+fields grants nothing; damaged state stays read-only.
+
+These checks are Hook task constraints, not an OS sandbox. Path checks inspect
+the filesystem before execution; later filesystem/PATH changes, races, tools
+that bypass hooks, and host-specific interception gaps remain outside that
+guarantee. A dedicated external directory prevents this exception from granting
+worktree edits; it is the authorized artifact destination, not a general
+configuration or executable directory. Allowing a call does not grant host
+permissions, and a Hook denial alone does not prove that the host did not
+execute it. No global permission/configuration change is needed for this grant.
+
 ## Upgrade
 
 Update the plugin or standalone Skill through its host installation flow, then

@@ -5,6 +5,7 @@ const {
 } = require('./contracts.cjs');
 
 const CURRENT_SCHEMA_VERSION = 4;
+const audit = require('./review-audit.cjs');
 
 function freshState() {
   return {
@@ -134,6 +135,10 @@ function normalizeState(parsed) {
 }
 
 function validStoredContract(contract, schemaVersion) {
+  // Older schema-4 contracts predate audit grants: absence means no authority.
+  if (Object.hasOwn(contract, 'auditOutput') && !audit.validAuditDirectory(contract.auditOutput)
+      || Object.hasOwn(contract, 'reportBinding') && (!audit.validReportBinding(contract.reportBinding)
+        || contract.reportBinding !== null && !contract.auditOutput)) return false;
   const checks = {
     mode: value => value === 'unconfirmed' || MODES.has(value),
     level: value => LEVELS.has(value),

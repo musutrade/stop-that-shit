@@ -5,13 +5,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { decide } = require('../src/decision.cjs');
+const { evaluatePolicyCase } = require('../scripts/policy-case.cjs');
 
 const casesRoot = path.join(__dirname, '..', 'cases', '0.0.1');
 
 for (const file of fs.readdirSync(casesRoot).filter((name) => name.endsWith('.json')).sort()) {
   const testCase = JSON.parse(fs.readFileSync(path.join(casesRoot, file), 'utf8'));
   test(`${testCase.id}: ${testCase.title}`, () => {
-    const actual = decide(testCase.input);
+    const actual = evaluatePolicyCase(testCase);
     for (const [key, value] of Object.entries(testCase.expected)) {
       assert.deepEqual(actual[key], value, `${key} mismatch`);
     }
