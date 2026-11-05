@@ -1,5 +1,7 @@
 'use strict';
 
+const audit = require('./review-audit.cjs');
+
 const MODES = new Set(['answer', 'review', 'change', 'monitor', 'open']);
 const LEVELS = new Set(['watch', 'guard', 'lock', 'off']);
 const HASH_POLICIES = new Set(['deny', 'ask', 'allow']);
@@ -14,16 +16,23 @@ function defaultContract() {
     hashPolicy: 'deny',
     allowedPaths: null,
     dependencyPolicy: 'ask',
+    auditOutput: null,
+    reportBinding: null,
     source: 'default'
   };
 }
 
 function directiveHead(prompt, matchEnd) {
   const tail = prompt.slice(matchEnd).replace(/^[ \t]+/, '');
-  const boundaries = [tail.indexOf('--'), tail.search(/:(?=\s|$)/), tail.indexOf('\n')]
-    .filter((index) => index >= 0);
-  const end = boundaries.length ? Math.min(...boundaries) : tail.length;
-  return tail.slice(0, end).trim();
+  let quote = null;
+  for (let index = 0; index < tail.length; index++) {
+    const char = tail[index];
+    if (quote) { if (char === quote) quote = null; continue; }
+    if (char === '"' || char === "'") { quote = char; continue; }
+    if (char === '\n' || char === ':' && /\s|^$/.test(tail[index + 1] || '')
+        || tail.slice(index, index + 2) === '--' && (index === 0 || /\s/.test(tail[index - 1]))) return tail.slice(0, index).trim();
+  }
+  return tail.trim();
 }
 
 function parseDirective(prompt) {
@@ -33,8 +42,14 @@ function parseDirective(prompt) {
   if (!mention) return null;
 
   const head = directiveHead(prompt, mention.index + mention[0].length);
-  const tokens = head.split(/[\s,]+/).map((token) => token.trim()).filter(Boolean);
+  const tokens = head.match(/(?:[^\s,"']+|"[^"]*"|'[^']*')+/g) || [];
   const parsed = { mentioned: true, error: null, warning: null };
+  let quote = null;
+  for (const char of head) {
+    if (quote) { if (char === quote) quote = null; }
+    else if (char === '"' || char === "'") quote = char;
+  }
+  if (quote) return { ...parsed, error: { code: 'INVALID_DIRECTIVE_TOKEN', message: 'Unclosed directive field quote.' } };
 
   function setField(field, value, token) {
     if (Object.hasOwn(parsed, field) && JSON.stringify(parsed[field]) !== JSON.stringify(value)) {
@@ -97,6 +112,13 @@ function parseDirective(prompt) {
     const dependencies = /^deps=(deny|ask|allow)$/.exec(token);
     if (dependencies && SCOPE_POLICIES.has(dependencies[1])) {
       setField('dependencyPolicy', dependencies[1], rawToken);
+      continue;
+    }
+    const auditField = /^(audit-dir|report-binding)=(.*)$/i.exec(rawToken);
+    if (auditField) {
+      let value = auditField[2];
+      if (/^["']/.test(value) && value.at(-1) === value[0]) value = value.slice(1, -1);
+      setField(auditField[1].toLowerCase() === 'audit-dir' ? 'auditDirectory' : 'reportBindingPath', value, rawToken);
       continue;
     }
     parsed.error = {
@@ -206,6 +228,8 @@ function normalizeContract(previousContract) {
   delete previous.totalAgentBudget;
   delete previous.concurrentAgentBudget;
   delete previous.agentsUsed;
+  previous.auditOutput = audit.validAuditDirectory(supplied.auditOutput ?? null) ? supplied.auditOutput ?? null : null;
+  previous.reportBinding = previous.auditOutput && audit.validReportBinding(supplied.reportBinding ?? null) ? supplied.reportBinding ?? null : null;
   return previous;
 }
 
@@ -263,18 +287,22 @@ function narrowContract(parentContract, childContract) {
   if (child.source === 'default' && Object.keys(defaults).every(key => child[key] === defaults[key])) {
     return { ...parent };
   }
+  const mode = narrowerScalar(parent.mode, child.mode, MODE_AUTHORITY);
+  const auditOutput = mode === 'review' ? audit.narrowedDirectory(parent.auditOutput, child.auditOutput) : null;
   return {
     ...child,
-    mode: narrowerScalar(parent.mode, child.mode, MODE_AUTHORITY),
+    mode,
     level: narrowerScalar(parent.level, child.level, LEVEL_AUTHORITY),
     agentBudget: Math.min(parent.agentBudget, child.agentBudget),
     hashPolicy: narrowerScalar(parent.hashPolicy, child.hashPolicy, POLICY_AUTHORITY),
     allowedPaths: narrowerPaths(parent.allowedPaths, child.allowedPaths),
-    dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY)
+    dependencyPolicy: narrowerScalar(parent.dependencyPolicy, child.dependencyPolicy, POLICY_AUTHORITY),
+    auditOutput,
+    reportBinding: auditOutput && audit.sameBinding(parent.reportBinding, child.reportBinding) ? child.reportBinding : null
   };
 }
 
-function parseContractPrompt(prompt, previousContract = defaultContract()) {
+function parseContractPrompt(prompt, previousContract = defaultContract(), context = {}) {
   const previous = normalizeContract(previousContract);
   const text = String(prompt || '');
   const directive = parseDirective(text);
@@ -317,6 +345,12 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
       next.dependencyPolicy = directive.dependencyPolicy;
       changed = true;
     }
+    // Every explicit task mode starts a new grant lifetime, even another review.
+    if (directive.mode || directive.level === 'off' || directive.level === 'watch') {
+      if (next.auditOutput || next.reportBinding) changed = true;
+      next.auditOutput = null;
+      next.reportBinding = null;
+    }
     if (directive.mode && !directive.level && next.level === 'watch') {
       next.level = 'guard';
       changed = true;
@@ -324,8 +358,27 @@ function parseContractPrompt(prompt, previousContract = defaultContract()) {
     if (directive.level === 'off') {
       next.level = 'off';
     }
+    if (Object.hasOwn(directive, 'auditDirectory') || Object.hasOwn(directive, 'reportBindingPath')) {
+      try {
+        if (next.mode !== 'review' || !['guard', 'lock'].includes(next.level)) throw new Error('Audit grants require enforcing review mode');
+        if (Object.hasOwn(directive, 'auditDirectory')) {
+          next.auditOutput = directive.auditDirectory === 'none' ? null : audit.auditDirectory(directive.auditDirectory, context.cwd || process.cwd());
+          // A changed output boundary never retains a dormant message grant.
+          next.reportBinding = null;
+        }
+        if (Object.hasOwn(directive, 'reportBindingPath')) next.reportBinding = directive.reportBindingPath === 'none'
+          ? null : audit.reportBinding(directive.reportBindingPath, context, next.auditOutput);
+        changed = true;
+      } catch (error) {
+        return { contract: previous, changed: false, directive: true, correction: Boolean(correction), warning: null,
+          error: { code: 'INVALID_AUDIT_GRANT', message: error.message } };
+      }
+    }
     next.source = 'directive';
   } else if (correction) {
+    if (next.auditOutput || next.reportBinding) changed = true;
+    next.auditOutput = null;
+    next.reportBinding = null;
     if (correction.mode !== next.mode) {
       next.mode = correction.mode;
       changed = true;

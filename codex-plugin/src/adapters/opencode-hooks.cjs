@@ -34,6 +34,7 @@ function toPromptEvent(input, output, context = {}) {
     kind: 'prompt.submit',
     sessionId: String(context.controlSessionID || input && input.sessionID || ''),
     prompt: promptText(output && output.parts),
+    cwd: context.directory,
     host: hostMetadata(input)
   };
 }

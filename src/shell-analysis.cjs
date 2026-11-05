@@ -54,7 +54,7 @@ const WRITE_SHELL_COMMANDS = new Set([
 function staticShellCommands(text) {
   const commands = [];
   let args = [], word = '', inWord = false, quote = null, separator = null;
-  let nativeQuotes = false, hasPipe = false;
+  let nativeQuotes = false, hasPipe = false, hasSeparator = false;
   const finishWord = () => {
     if (inWord) args.push(word);
     word = ''; inWord = false;
@@ -88,6 +88,7 @@ function staticShellCommands(text) {
     // Without a shell identity, do not interpret an unquoted backslash.
     if (char === '\\') return null;
     if (char === '\r' || char === '\n' || char === ';' || char === '|' || char === '&') {
+      hasSeparator = true;
       finishWord();
       // PowerShell also accepts a standalone CR as a command separator.
       const operator = char === '\r' ? '\n'
@@ -107,7 +108,14 @@ function staticShellCommands(text) {
   finishWord();
   if (args.length) finishCommand();
   else if (['&&', '||', '|'].includes(separator)) return null;
-  return commands.length ? { commands, hasPipe } : null;
+  return commands.length ? { commands, hasPipe, hasSeparator } : null;
+}
+
+function directCommandArguments(command) {
+  if (typeof command !== 'string') return null;
+  const parsed = staticShellCommands(command);
+  return parsed?.commands?.length === 1 && !parsed.hasSeparator && !parsed.commands[0].nativeQuotes
+    ? parsed.commands[0].args : null;
 }
 
 // Consume ripgrep option values before interpreting -- or executable options.
@@ -320,4 +328,4 @@ function analyzeShellInput(toolInput) {
   return analysis;
 }
 
-module.exports = { analyzeShell, analyzeShellInput, classifyShell, isDirectDependencyCommand, directDependencyArguments };
+module.exports = { analyzeShell, analyzeShellInput, classifyShell, isDirectDependencyCommand, directDependencyArguments, directCommandArguments };

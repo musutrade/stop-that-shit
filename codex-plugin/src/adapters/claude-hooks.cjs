@@ -58,6 +58,7 @@ function toControlEvent(input) {
     lifecycleVersion: 2,
     kind,
     sessionId: String(input.session_id || ''),
+    cwd: input.cwd,
     turnId: input.prompt_id || input.turn_id || null,
     host: {
       family: 'claude-code',

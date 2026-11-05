@@ -142,7 +142,14 @@ They do not establish general Guard detection of sufficient proof.
 
 ## Executable policy pairs
 
-The 18 JSON cases form nine Bad/Good pairs. The `0.0.1/` directory name is
+Issue [#1](https://github.com/musutrade/stop-that-shit/issues/1) pairs an implicit
+report write with the same write under an explicit external audit grant:
+[`STS-I-003-B`](0.0.1/STS-I-003-B.json) / [`STS-I-003-G`](0.0.1/STS-I-003-G.json).
+The runner materializes their declared external-directory fixture because the
+policy verifies real filesystem components. Further path, binding, session,
+revocation and host-adapter cases are in `test/review-audit.test.cjs`.
+
+The JSON cases form executable Bad/Good pairs. The `0.0.1/` directory name is
 historical, not the current release version. Inputs supply the fields below;
 semantic labels do not imply automatic host inference.
 

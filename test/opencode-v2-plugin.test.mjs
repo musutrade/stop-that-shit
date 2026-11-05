@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { Effect, Exit, PubSub, Scope, Stream } from 'effect';
 import * as entry from '../opencode/stop-that-shit.mjs';
-import { acquireSessionLock, readState, statePath } from '../src/state.cjs';
+import { acquireSessionLock, readState, statePath, updateSession } from '../src/state.cjs';
 
 async function host(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sts-opencode-v2-'));
@@ -147,10 +147,15 @@ test('V2 follows an editable host agent for a new plain root prompt but not a qu
   const before = () => h.run(Effect.result(h.hooks.tool['execute.before'](write())));
   h.messages.get('root').push(user('msg_001', '$stop-that-shit review'));
   assert.equal((await before())._tag, 'Failure');
+  updateSession('root', h.dataDir, state => {
+    state.contract.auditOutput = { directory: path.join(h.dataDir, 'output'), workspace: path.join(h.dataDir, 'workspace') };
+  });
   h.messages.get('root').push(user('msg_002', 'Explain `$stop-that-shit change` to me.'));
   assert.equal((await before())._tag, 'Failure');
   h.messages.get('root').push(user('msg_003', 'Now implement the fix.'));
   assert.equal((await before())._tag, 'Success');
+  assert.equal(readState('root', h.dataDir).contract.auditOutput, null);
+  assert.equal(readState('root', h.dataDir).contract.reportBinding, null);
 });
 
 for (const instruction of ['review only; do not edit anything', '只审查，不要修改任何文件']) {

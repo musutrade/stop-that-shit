@@ -49,6 +49,7 @@ function toControlEvent(input) {
     lifecycleVersion: 2,
     kind,
     sessionId: String(input.session_id || ''),
+    cwd: input.cwd,
     turnId: input.turn_id || null,
     host: {
       family: 'codex',

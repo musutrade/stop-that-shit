@@ -91,7 +91,8 @@ test('saved and in-memory legacy contracts preserve the same agent limit and aut
     const fromPrompt = parseContractPrompt('Continue', legacy).contract;
     const expectedContract = {
       mode: 'change', level: 'guard', hashPolicy: 'allow', dependencyPolicy: 'deny',
-      allowedPaths: ['src/**'], source: 'directive', agentBudget: expected
+      allowedPaths: ['src/**'], source: 'directive', agentBudget: expected,
+      auditOutput: null, reportBinding: null
     };
     assert.deepEqual(fromDisk, expectedContract, JSON.stringify(fields));
     assert.deepEqual(fromPrompt, expectedContract, JSON.stringify(fields));

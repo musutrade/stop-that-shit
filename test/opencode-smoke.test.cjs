@@ -15,11 +15,13 @@ const root = path.join(__dirname, '..');
 // in-process HTTP server.
 function runOpencode(args, options = {}) {
   return new Promise((resolve) => {
+    const { input, ...spawnOptions } = options;
     const child = spawn('opencode', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       timeout: 180000,
-      ...options
+      ...spawnOptions
     });
+    if (input !== undefined) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
@@ -97,9 +99,10 @@ test('installed OpenCode plugin denies a write under a review contract', { skip:
   const run = await runOpencode([
     'run',
     '--dir', workspace,
-    '--print-logs',
-    '$stop-that-shit review -- Create blocked.txt with content denied.'
-  ], { env });
+    '--print-logs'
+  // V1 quotes positional prompts containing spaces. Stdin preserves the root
+  // directive, matching the dedicated dual-version host acceptance path.
+  ], { env, input: '$stop-that-shit review -- Create blocked.txt with content denied.' });
   const combined = `${run.stdout}\n${run.stderr}`;
 
   assert.ok(llm.requests.length >= 1, `the fake model received no request:\n${combined}`);

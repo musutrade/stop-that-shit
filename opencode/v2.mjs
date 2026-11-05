@@ -64,7 +64,7 @@ export const openCodeV2Effect = (ctx) => Effect.gen(function* () {
             updateSession(root.id, dataDir, (latest) => {
               if (latest.contract.mode === 'review' && !latest.directiveError
                   && allowsHostPromotion(message.text, latest.contract)) {
-                latest.contract = { ...latest.contract, mode: 'change', source: 'host' };
+                latest.contract = { ...latest.contract, mode: 'change', source: 'host', auditOutput: null, reportBinding: null };
               }
             });
           }

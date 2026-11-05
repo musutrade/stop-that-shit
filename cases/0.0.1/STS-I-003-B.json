@@ -1,0 +1,13 @@
+{
+  "id": "STS-I-003-B",
+  "kind": "bad",
+  "family": "I",
+  "title": "A report filename alone does not authorize a review write",
+  "sourceIssue": "https://github.com/musutrade/stop-that-shit/issues/1",
+  "fixture": "external-audit",
+  "input": {
+    "contract": { "mode": "review", "level": "guard", "auditOutput": null },
+    "action": { "mutability": "write", "hostFamily": "codex", "name": "Write", "cwd": "$AUDIT_WORKSPACE", "input": { "file_path": "$AUDIT_REPORT" }, "affectedPaths": ["$AUDIT_REPORT"] }
+  },
+  "expected": { "outcome": "deny_and_explain", "family": "I", "reasonCode": "MODE_FORBIDS_MUTATION" }
+}

@@ -4,6 +4,7 @@ const nodePath = require('node:path');
 const { DEFAULT_AGENT_LIMIT } = require('./contracts.cjs');
 const { inspectDelegation } = require('./delegation-state.cjs');
 const { SHELL_ANALYSIS_REASONS, isShellAnalysisReason } = require('./control-protocol.cjs');
+const { authorizeAuditAction } = require('./review-audit.cjs');
 
 function analysisExplanation(action) {
   return isShellAnalysisReason(action.analysisReason)
@@ -93,7 +94,8 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
   }
 
   const nonMutatingMode = ['answer', 'review', 'monitor'].includes(mode);
-  if (nonMutatingMode && action.mutability === 'write') {
+  const auditAllowed = authorizeAuditAction(contract, action);
+  if (nonMutatingMode && action.mutability === 'write' && !auditAllowed) {
     return decision(
       controlledOutcome(level),
       'I',
@@ -103,7 +105,7 @@ function decide({ contract, action, state = {}, delegation = inspectDelegation(s
     );
   }
 
-  if (nonMutatingMode && action.mutability === 'unknown') {
+  if (nonMutatingMode && action.mutability === 'unknown' && !auditAllowed) {
     return decision(
       controlledOutcome(level, 'require_user_approval'),
       'I',

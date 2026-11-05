@@ -228,7 +228,7 @@ export const StopThatShitPlugin = async ({ client, directory }, options = {}) =>
     return updateSession(controlSessionID, dataDir, (state) => {
       if (state.directiveError || state.contract.mode !== 'review'
           || !allowsHostPromotion(text, state.contract)) return false;
-      state.contract = { ...state.contract, mode: 'change', source: 'host' };
+      state.contract = { ...state.contract, mode: 'change', source: 'host', auditOutput: null, reportBinding: null };
       return true;
     });
   }

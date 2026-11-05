@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
-const { readState } = require('../src/state.cjs');
+const { readState, updateSession } = require('../src/state.cjs');
 
 const root = path.join(__dirname, '..');
 const pluginUrl = pathToFileURL(path.join(root, 'opencode', 'stop-that-shit.mjs')).href;
@@ -571,10 +571,15 @@ test('an edit-capable agent message advances a review contract to change', async
 
   await sendPartEvent(hooks, textPart('root', 'msg-review', '$stop-that-shit review -- inspect only'));
   assert.equal(readState('root', dataDir).contract.mode, 'review');
+  updateSession('root', dataDir, state => {
+    state.contract.auditOutput = { directory: path.join(dataDir, 'output'), workspace: path.join(dataDir, 'workspace') };
+  });
 
   await sendPartEvent(hooks, textPart('root', 'msg-build', 'Execute the changes we discussed.'));
   const state = readState('root', dataDir).contract;
   assert.equal(state.mode, 'change');
+  assert.equal(state.auditOutput, null);
+  assert.equal(state.reportBinding, null);
   assert.equal(state.source, 'host');
   assert.equal(state.level, 'guard');
 

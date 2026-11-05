@@ -121,6 +121,31 @@ dialog. A later corrected directive can supply the missing task authority.
 
 ## Codex mapping
 
+### Task-scoped audit exceptions
+
+The shared review contract optionally carries `auditOutput` (canonical external
+directory and workspace) and `reportBinding` (canonical file/executable and a
+pinned public binding snapshot). Explicit `audit-dir=` and `report-binding=`
+directive fields are the authority source. New task modes revoke them; legacy
+state defaults them to null. See the [usage and revocation contract](INSTALL.md#restricted-audit-output-in-review).
+
+For these exceptions, prompt events must provide `cwd`, native `sessionId` and
+`host.family`. Action events retain the native tool `name`, `input`, host cwd
+and source session. Codex and Claude provide their native hook identity;
+OpenCode preserves `sourceSessionId` separately from the shared root control
+session so a child cannot report through a parent's binding. File targets are
+checked from original native inputs before path normalization. Only the listed
+native editing tools and a statically parsed direct CrewMoor send can receive
+an exception. The decision still checks all other restrictions after the mode
+exception; this does not reclassify CrewMoor or arbitrary message tools as reads.
+
+The controller passes these inputs to the decision but runtime audit retains
+its existing metadata-only serialization. It does not record message contents
+or the binding snapshot in the runtime journal. Native host permissions and
+CrewMoor live routing checks remain separate from the Hook decision.
+
+### Directive parsing
+
 The shared parser accepts one directive at the start of the first non-empty
 line, outside quotes and code blocks. Formal directive parsing does not scan
 later text for fields.
