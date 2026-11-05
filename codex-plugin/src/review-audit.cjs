@@ -13,8 +13,17 @@ const inside = (root, target) => {
 
 // Check the original spelling before resolving: normalization would conceal a
 // symlink followed by '..'. This is a static check, not filesystem confinement.
+function validPathSpelling(value, platform = process.platform) {
+  if (!text(value) || /[\0\r\n]/.test(value)) return false;
+  const parts = value.split(/[\\/]/);
+  if (parts.includes('..')) return false;
+  // Win32 removes trailing dots/spaces from components, including '.. '. Do
+  // not let lexical containment authorize a different filesystem destination.
+  return platform !== 'win32' || !parts.some(part => part !== '.' && /[. ]$/.test(part));
+}
+
 function checkedPath(value, cwd, { directory = false, newFile = false } = {}) {
-  if (!text(value) || /[\0\r\n]/.test(value) || value.split(/[\\/]/).includes('..')) throw new Error('Unproven path');
+  if (!validPathSpelling(value) || cwd != null && !validPathSpelling(cwd)) throw new Error('Unproven path');
   if (process.platform !== 'win32' && (/^[A-Za-z]:[\\/]|^\\/.test(value) || value.includes('\\'))) throw new Error('Foreign path');
   if (!path.isAbsolute(value) && !path.isAbsolute(cwd || '')) throw new Error('Missing absolute cwd');
   const target = path.resolve(cwd || '', value);
@@ -180,5 +189,5 @@ function authorizeAuditAction(contract, action) {
   } catch { return false; }
 }
 
-module.exports = { auditDirectory, reportBinding, validAuditDirectory, validReportBinding,
+module.exports = { auditDirectory, reportBinding, validAuditDirectory, validReportBinding, validPathSpelling,
   narrowedDirectory, sameBinding, authorizeAuditAction };

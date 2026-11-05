@@ -19,6 +19,14 @@ export function mentionsDirective(text) {
 }
 
 export function allowsHostPromotion(text, contract) {
+  // CrewMoor peers arrive as root transport messages, not direct user edit
+  // authority. Inspect only the envelope shape; never parse its content as a
+  // directive or apply this rule to unrelated JSON user prompts.
+  try {
+    const envelope = JSON.parse(String(text));
+    if (envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+        && Object.hasOwn(envelope, 'team') && Object.hasOwn(envelope, 'message')) return false;
+  } catch {}
   return !mentionsDirective(text) && !parseContractPrompt(text, contract).correction;
 }
 

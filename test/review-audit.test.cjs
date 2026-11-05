@@ -13,6 +13,7 @@ const codex = require('../src/adapters/codex-hooks.cjs');
 const claude = require('../src/adapters/claude-hooks.cjs');
 const opencode = require('../src/adapters/opencode-hooks.cjs');
 const v2 = require('../src/adapters/opencode-v2-hooks.cjs');
+const { validPathSpelling } = require('../src/review-audit.cjs');
 
 function fixture(t, family = 'codex') {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sts-audit-')));
@@ -121,6 +122,28 @@ test('absolute and relative artifact paths work; boundary, traversal, unknown an
     { ...f.action, name: 'apply_patch', input: `*** Begin Patch\n*** Delete File: ${f.messagePath}\n*** End Patch` }]) {
     assert.equal(allowed(f.contract, action), false);
   }
+});
+
+test('Win32 trailing-dot/space aliases cannot turn a lexical audit target into a different path', t => {
+  const f = fixture(t);
+  const badComponents = ['.. ', '.. .', '..  ', '...', 'report.', 'report ', 'sub.'];
+  for (const component of badComponents) {
+    for (const separator of ['/', '\\']) {
+      const target = `C:${separator}audit${separator}${component}${separator}outside.txt`;
+      assert.equal(validPathSpelling(target, 'win32'), false, target);
+    }
+    assert.equal(validPathSpelling(component, 'win32'), false, component);
+    // On Windows CI also exercise the actual filesystem-backed decision path.
+    if (process.platform === 'win32') {
+      const target = `${f.output}\\${component}\\outside.txt`;
+      assert.equal(allowed(f.contract, { ...f.action, input: { file_path: target } }), false, target);
+      assert.ok(parseContractPrompt(`$stop-that-shit review audit-dir="${f.output}\\${component}" -- task`, f.contract, f.context).error);
+    }
+  }
+  for (const target of ['C:\\audit\\report.md', '.\\report.md', 'C:/audit/sub/report.json']) {
+    assert.equal(validPathSpelling(target, 'win32'), true, target);
+  }
+  assert.equal(validPathSpelling('/audit/report.', 'linux'), true);
 });
 
 test('symlink output, target, parent and binding escapes deny, including replacement after grant', t => {

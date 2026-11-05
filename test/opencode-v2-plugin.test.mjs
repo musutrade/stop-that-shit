@@ -48,6 +48,35 @@ const write = (id = 'call-write', sessionID = 'root', file = '/repo/a.txt') => (
 });
 const user = (id, text) => ({ type: 'user', id, text, time: { created: 1 } });
 
+for (const granted of [false, true]) {
+  test(`CrewMoor envelopes preserve V2 review and its audit boundary (grant=${granted})`, async t => {
+    const h = await host(t);
+    const cwd = path.join(h.dataDir, 'workspace'), output = path.join(h.dataDir, 'output');
+    for (const directory of [cwd, output, path.join(cwd, '.git')]) fs.mkdirSync(directory);
+    h.sessions.get('root').location.directory = cwd;
+    h.messages.get('root').push(user('initial', `$stop-that-shit review${granted ? ` audit-dir="${output}"` : ''} -- inspect only`));
+    const before = file => h.run(Effect.result(h.hooks.tool['execute.before'](write('write-1', 'root', file))));
+    assert.equal((await before(path.join(cwd, 'code.js')))._tag, 'Failure');
+    const prior = readState('root', h.dataDir).contract;
+    h.messages.get('root').push(user('business', JSON.stringify({ team: 'owned', message: { id: 'business-1', from: 'dispatcher',
+      to: 'audit', reply_to: null, content: 'Continue the audit and report findings.' } })));
+    assert.equal((await before(path.join(cwd, 'code.js')))._tag, 'Failure');
+    assert.deepEqual(readState('root', h.dataDir).contract, prior);
+    assert.equal(prior.mode, 'review');
+    assert.equal((await before(path.join(output, 'report.md')))._tag, granted ? 'Success' : 'Failure');
+  });
+}
+
+test('only the CrewMoor envelope shape excludes JSON prompts from host promotion', async t => {
+  const { allowsHostPromotion } = await import('../opencode/runtime.mjs');
+  for (const envelope of [{ team: 'owned', message: {} }, { message: null, team: 'owned', extra: true }]) {
+    assert.equal(allowsHostPromotion(JSON.stringify(envelope), { mode: 'review' }), false);
+  }
+  for (const prompt of ['Now implement the fix.', JSON.stringify({ instruction: 'Implement the fix.' })]) {
+    assert.equal(allowsHostPromotion(prompt, { mode: 'review' }), true);
+  }
+});
+
 test('V2 ordinary tool results return watch context without rewriting session state', async t => {
   const h = await host(t);
   h.messages.get('root').push(user('u1', '$stop-that-shit watch review'));

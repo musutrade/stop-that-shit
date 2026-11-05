@@ -135,12 +135,36 @@ async function plugin(t, sessions, messages = {}, options = {}) {
   const dataDir = options.dataDir || workspace(t);
   const client = fakeClient(dataDir, sessions, messages, options);
   const module = await import(pluginUrl);
-  const hooks = await module.StopThatShitPlugin({ client, directory: '/repo' }, { dataDir });
+  const hooks = await module.StopThatShitPlugin({ client, directory: options.directory || '/repo' }, { dataDir });
   return { client, dataDir, hooks };
 }
 
 function sendPartEvent(hooks, part) {
   return hooks.event({ event: { type: 'message.part.updated', properties: { part } } });
+}
+
+for (const granted of [false, true]) {
+  test(`CrewMoor envelopes preserve V1 review and its audit boundary (grant=${granted})`, async t => {
+    const root = workspace(t), cwd = path.join(root, 'workspace'), output = path.join(root, 'output');
+    for (const directory of [cwd, output, path.join(cwd, '.git')]) fs.mkdirSync(directory);
+    const initial = `$stop-that-shit review${granted ? ` audit-dir="${output}"` : ''} -- inspect only`;
+    const envelope = JSON.stringify({ team: 'owned', message: { id: 'business-1', from: 'dispatcher', to: 'audit', reply_to: null,
+      content: 'Continue the audit and report findings.' } });
+    const messages = { initial: message('root', 'initial', initial), business: message('root', 'business', envelope) };
+    const { hooks, dataDir } = await plugin(t, { root: { id: 'root' } }, messages,
+      { directory: cwd, dataDir: path.join(root, 'guard') });
+    const before = file => hooks['tool.execute.before']({ tool: 'write', sessionID: 'root', callID: 'write-1' },
+      { args: { filePath: file, content: 'audit' } });
+    await sendPartEvent(hooks, messages.initial.parts[0]);
+    const prior = readState('root', dataDir).contract;
+    await assert.rejects(before(path.join(cwd, 'code.js')), /MODE_FORBIDS_MUTATION/);
+    await sendPartEvent(hooks, messages.business.parts[0]);
+    assert.deepEqual(readState('root', dataDir).contract, prior);
+    assert.equal(prior.mode, 'review');
+    await assert.rejects(before(path.join(cwd, 'code.js')), /MODE_FORBIDS_MUTATION/);
+    if (granted) await assert.doesNotReject(before(path.join(output, 'report.md')));
+    else await assert.rejects(before(path.join(output, 'report.md')), /MODE_FORBIDS_MUTATION/);
+  });
 }
 
 for (const failure of ['fetch', 'session resolution', 'empty parts']) {

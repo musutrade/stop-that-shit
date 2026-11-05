@@ -174,6 +174,10 @@ unknown tools/paths, shell redirection, directory creation and code/configuratio
 writes in the worktree remain denied. Filenames and claims that a tool is
 writing a report grant no authority.
 
+On Windows, components with trailing dots or spaces are rejected before
+filesystem lookup, including `.. ` aliases; lexical containment must not
+authorize a path that Win32 normalizes to a different destination.
+
 Write the flat CrewMoor message JSON in the same audit directory, for example:
 
 ```json
@@ -201,7 +205,9 @@ before supplying the explicit grant; do not rebind a different session to make
 an old grant work.
 
 The grant survives ordinary prompts and a valid saved-state resume of the same
-task while review remains active. OpenCode's existing editable-root prompt
+task while review remains active. A normal CrewMoor business envelope preserves
+review and its grants; its contents cannot trigger editable-host promotion.
+OpenCode's existing direct editable-root user prompt
 promotion to change also clears the grant. Every new explicit mode directive (including another `review`), `watch`,
 `off`, or natural mode correction clears it. To revoke it immediately:
 
