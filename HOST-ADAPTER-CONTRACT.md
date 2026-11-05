@@ -139,6 +139,12 @@ native editing tools and a statically parsed direct CrewMoor send can receive
 an exception. The decision still checks all other restrictions after the mode
 exception; this does not reclassify CrewMoor or arbitrary message tools as reads.
 
+Codex `apply_patch` path classification and review authorization share the same
+original text extraction: a raw string, or the existing `command`, `patch`,
+`content`, and `new_string` wrappers. Unknown object fields do not create a
+second patch-input authority path. Mixed targets, deletion and relocation still
+fail the audit exception.
+
 The controller passes these inputs to the decision but runtime audit retains
 its existing metadata-only serialization. It does not record message contents
 or the binding snapshot in the runtime journal. Native host permissions and

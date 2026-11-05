@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { directCommandArguments } = require('./shell-analysis.cjs');
+const { inputText } = require('./tool-input.cjs');
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0;
@@ -136,7 +137,8 @@ function fileTargets(action) {
   if ((host === 'codex' || host === 'claude-code') && ['Write', 'Edit'].includes(name)) return [input?.file_path || input?.path];
   if (host === 'opencode' && ['write', 'edit'].includes(name)) return [input?.filePath || input?.path];
   if ((host === 'codex' && name === 'apply_patch') || host === 'opencode' && ['apply_patch', 'patch'].includes(name)) {
-    const patch = typeof input === 'string' ? input : input?.patchText || input?.patch || input?.input || '';
+    const patch = host === 'codex' ? inputText(input)
+      : typeof input === 'string' ? input : input?.patchText || input?.patch || input?.input || '';
     if (typeof patch !== 'string' || /^\*\*\* (?:Delete File:|Move to:)/m.test(patch)) return null;
     return [...patch.matchAll(/^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$/gm)].map(match => match[1]);
   }

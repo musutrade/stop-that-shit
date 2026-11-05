@@ -1482,6 +1482,7 @@ module.exports = {
 const fs = require('node:fs');
 const path = require('node:path');
 const { directCommandArguments } = __require("src/shell-analysis.cjs");
+const { inputText } = __require("src/tool-input.cjs");
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0;
@@ -1615,7 +1616,8 @@ function fileTargets(action) {
   if ((host === 'codex' || host === 'claude-code') && ['Write', 'Edit'].includes(name)) return [input?.file_path || input?.path];
   if (host === 'opencode' && ['write', 'edit'].includes(name)) return [input?.filePath || input?.path];
   if ((host === 'codex' && name === 'apply_patch') || host === 'opencode' && ['apply_patch', 'patch'].includes(name)) {
-    const patch = typeof input === 'string' ? input : input?.patchText || input?.patch || input?.input || '';
+    const patch = host === 'codex' ? inputText(input)
+      : typeof input === 'string' ? input : input?.patchText || input?.patch || input?.input || '';
     if (typeof patch !== 'string' || /^\*\*\* (?:Delete File:|Move to:)/m.test(patch)) return null;
     return [...patch.matchAll(/^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$/gm)].map(match => match[1]);
   }
@@ -2004,6 +2006,20 @@ function analyzeShellInput(toolInput) {
 }
 
 module.exports = { analyzeShell, analyzeShellInput, classifyShell, isDirectDependencyCommand, directDependencyArguments, directCommandArguments };
+
+},
+"src/tool-input.cjs": function(module, exports, __require) {
+'use strict';
+
+// Keep the native Codex text wrappers identical for path classification and
+// review authorization. Unknown shapes yield no provable patch targets.
+function inputText(toolInput) {
+  if (typeof toolInput === 'string') return toolInput;
+  if (!toolInput || typeof toolInput !== 'object') return '';
+  return String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '');
+}
+
+module.exports = { inputText };
 
 },
 "src/delegation-state.cjs": function(module, exports, __require) {
@@ -4644,6 +4660,7 @@ const nodePath = require('node:path');
 const { analyzeShell, analyzeShellInput, classifyShell } = __require("src/shell-analysis.cjs");
 const { patchDependencyIntent } = __require("src/manifest-dependencies.cjs");
 const { detectHashIntent } = __require("src/hash-intent.cjs");
+const { inputText } = __require("src/tool-input.cjs");
 
 const WRITE_NAME = /(?:^|__|_)(?:add|append|apply|archive|close|commit|copy|create|delete|deploy|edit|install|merge|move|patch|post|publish|push|remove|rename|send|set|submit|update|upload|write)(?:$|__|_)/i;
 const READ_NAME = /(?:^|__|_)(?:cat|check|diff|fetch|find|get|inspect|list|load|open|read|review|search|show|status|view)(?:$|__|_)/i;
@@ -4656,12 +4673,6 @@ const CODEX_TOOL_NAMES = new Map([
   ...['spawn_agent', 'followup_task', 'send_message', 'list_agents', 'wait_agent', 'interrupt_agent']
     .map(name => [`collaboration${name}`, name])
 ]);
-
-function inputText(toolInput) {
-  if (typeof toolInput === 'string') return toolInput;
-  if (!toolInput || typeof toolInput !== 'object') return '';
-  return String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '');
-}
 
 function normalizePath(value, cwd) {
   let normalized = String(value || '').trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');

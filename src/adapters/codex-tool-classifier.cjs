@@ -4,6 +4,7 @@ const nodePath = require('node:path');
 const { analyzeShell, analyzeShellInput, classifyShell } = require('../shell-analysis.cjs');
 const { patchDependencyIntent } = require('../manifest-dependencies.cjs');
 const { detectHashIntent } = require('../hash-intent.cjs');
+const { inputText } = require('../tool-input.cjs');
 
 const WRITE_NAME = /(?:^|__|_)(?:add|append|apply|archive|close|commit|copy|create|delete|deploy|edit|install|merge|move|patch|post|publish|push|remove|rename|send|set|submit|update|upload|write)(?:$|__|_)/i;
 const READ_NAME = /(?:^|__|_)(?:cat|check|diff|fetch|find|get|inspect|list|load|open|read|review|search|show|status|view)(?:$|__|_)/i;
@@ -16,12 +17,6 @@ const CODEX_TOOL_NAMES = new Map([
   ...['spawn_agent', 'followup_task', 'send_message', 'list_agents', 'wait_agent', 'interrupt_agent']
     .map(name => [`collaboration${name}`, name])
 ]);
-
-function inputText(toolInput) {
-  if (typeof toolInput === 'string') return toolInput;
-  if (!toolInput || typeof toolInput !== 'object') return '';
-  return String(toolInput.command || toolInput.patch || toolInput.content || toolInput.new_string || '');
-}
 
 function normalizePath(value, cwd) {
   let normalized = String(value || '').trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');

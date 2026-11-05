@@ -211,6 +211,47 @@ test('audit exception preserves hash, dependencies, file lock, delegation and ch
   assert.equal(handleControlEvent(event, { dataDir: f.root }).error.code, 'AUDIT_BOUNDARY_WIDEN');
 });
 
+for (const field of [null, 'command', 'patch', 'content', 'new_string']) {
+  test(`Codex patch wrapper ${field || 'string'} uses the same targets from native adapter through decision`, t => {
+    const f = fixture(t), options = { dataDir: path.join(f.root, 'patch-data') };
+    const native = { session_id: f.context.sessionId, cwd: f.cwd };
+    handleControlEvent(codex.toControlEvent({ ...native, hook_event_name: 'UserPromptSubmit', prompt: f.prompt }), options);
+    const wrap = patch => field ? { [field]: patch } : patch;
+    const check = patch => {
+      const event = codex.toControlEvent({ ...native, hook_event_name: 'PreToolUse', tool_name: 'apply_patch', tool_input: wrap(patch) });
+      return { event, result: handleControlEvent(event, options) };
+    };
+    const add = file => `*** Add File: ${file}\n+finding\n`;
+    const patch = body => `*** Begin Patch\n${body}*** End Patch`;
+    const report = path.join(f.output, 'report.md'), message = path.join(f.output, 'new-message.json');
+    const good = check(patch(add(report) + add(message)));
+    assert.equal(good.event.action.affectedPaths.length, 2);
+    assert.equal(good.event.action.mutability, 'write');
+    assert.equal(good.event.action.hashIntent, false);
+    assert.equal(good.event.action.dependencyIntent, false);
+    assert.equal(good.result.kind, 'none');
+    for (const body of [add(report) + add(path.join(f.cwd, 'code.js')),
+      add(report) + add(f.output + '-sibling/report.md'),
+      `*** Delete File: ${report}\n`,
+      `*** Update File: ${report}\n*** Move to: ${message}\n@@\n-old\n+new\n`]) {
+      assert.equal(check(patch(body)).result.kind, 'deny', body);
+    }
+    assert.deepEqual(readState(f.context.sessionId, options.dataDir).contract, f.contract);
+  });
+}
+
+test('unsupported Codex patch shapes cannot gain an audit exception through a separate extractor', t => {
+  const f = fixture(t), options = { dataDir: path.join(f.root, 'patch-data') };
+  const native = { session_id: f.context.sessionId, cwd: f.cwd };
+  handleControlEvent(codex.toControlEvent({ ...native, hook_event_name: 'UserPromptSubmit', prompt: f.prompt }), options);
+  const patch = `*** Begin Patch\n*** Add File: ${f.output}/report.md\n+finding\n*** End Patch`;
+  for (const input of [{ patchText: patch }, { input: patch }, { unknown: patch }, null, 42]) {
+    const event = codex.toControlEvent({ ...native, hook_event_name: 'PreToolUse', tool_name: 'apply_patch', tool_input: input });
+    assert.deepEqual(event.action.affectedPaths, []);
+    assert.equal(handleControlEvent(event, options).kind, 'deny');
+  }
+});
+
 for (const family of ['codex', 'claude-code', 'opencode']) {
   test(`${family} adapter: explicit root grant, permitted artifact/report, resume and revoke`, t => {
     const f = fixture(t, family);
